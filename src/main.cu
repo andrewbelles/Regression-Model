@@ -1,80 +1,99 @@
 #include "../include/neural.hpp"
-#include <cuda_runtime_api.h>
-#include <driver_types.h>
+#include "../include/cuda_arena.hpp"
 #include <iostream>
 #include <random>
+#include <vector>
+
+float tanh_derivative(float x) {
+  return 1.0 - (tanh(x) * tanh(x));
+}
 
 int main(int argc, char *argv[]) {
-  std::random_device rd; 
+
+  std::random_device rd;
   std::mt19937 gen(rd());
-  std::uniform_real_distribution<> distribution(-5.0, 5.0);
+  std::uniform_real_distribution<> distribution(-1,1);
 
-  // Compute at compile time 
-  constexpr int size = 256;
-  constexpr dim3 blocks(16, 16);
-  constexpr dim3 grid((size + blocks.x - 1) / blocks.x, (size + blocks.y) / blocks.y);
+  // Create our arena to have 256MB of memory -> Figure a dynamic value we can use
+  cudaStream_t stream;
+  cudaStreamCreate(&stream);
+  ArenaAllocator arena(512 * 512 * 1024, stream);
 
-  // Generate Unified Memory for Matrices 
-  Matrix *A = new_matrix(size, size); 
-  Matrix *B = new_matrix(size, size);  
+  std::cout << "Arena Allocated\n";
 
-  // Vectors to fill matrices
-  float *a_vec, *b_vec;
+  uint layer_sizes[] = {1,256,256,1};
+  uint layer_count   = 3; 
+  uint input_size = 512;
+  Activation tanac = {
+    .f  = [](float x) -> float { return tanh(x); },
+    .df = [](float x) -> float { return 1.0 - (tanh(x) * tanh(x)); },
+    .type = Tanh,
+  };
 
-  // Allocate as unified
-  cudaMallocManaged(&a_vec, sizeof(float) * size);
-  cudaMallocManaged(&b_vec, sizeof(float) * size);
-
-  // Fill with random values  
-  for (int i = 0; i < size * size; i++) {
-    a_vec[i] = distribution(gen);
-    b_vec[i] = distribution(gen);
+  std::vector<Activation> funcs;
+  for (int i = 0; i < 3; i++) {
+    funcs.push_back(tanac);
   }
 
-  // Send data to gpu 
-  cudaMemPrefetchAsync(A, sizeof(Matrix), 0);
-  cudaMemPrefetchAsync(B, sizeof(Matrix), 0);
-  cudaMemPrefetchAsync(a_vec, sizeof(float) * size * size, 0);
-  cudaMemPrefetchAsync(b_vec, sizeof(float) * size * size, 0);
+  float *input;
+  cudaMallocManaged(&input, 512 * sizeof(float));
+  for (int i = 0; i < 512; i++) {
+    input[i] = distribution(gen); 
+  }
+
+  // Fill matrix with values
+  Matrix *input_mat = new_matrix(input_size, 1);
+  
+  dim3 blocks(BLOCKSIZE, BLOCKSIZE);
+  dim3 grid((input_mat->cols() + blocks.x - 1) / blocks.x, (input_mat->rows() + blocks.y - 1) / blocks.y);
+
+  cudaMemPrefetchAsync(input_mat->data, sizeof(float) * input_mat->cols() * input_mat->rows(), 0);
+  cudaMemPrefetchAsync(input_mat, sizeof(Matrix), 0);
+  cudaMemPrefetchAsync(input, sizeof(float) * input_size, 0);
+
+  fill_matrix<<<grid, blocks>>>(input_mat, input);
   cudaDeviceSynchronize();
 
-  // Fill matrices with data
-  fill_matrix<<<grid, blocks>>>(A, a_vec);
-  fill_matrix<<<grid, blocks>>>(B, b_vec);
+  Network *network = new_network(layer_sizes, layer_count, input_size, funcs);
+
+  // Test matmul on layers between 
+  std::cout << "First matmul\n";
+
+  const uint a_row = input_mat->rows(), a_col = input_mat->cols();
+  uint b_row = network->layers[0].weights.rows(), b_col = network->layers[0].weights.cols();
+  Matrix *layer1_out = matrix_multiplication(a_row, a_col, b_row, b_col, input_mat, &network->layers[0].weights, arena);
+  std::cout << "Second matmul\n";
+  uint n_row = network->layers[1].weights.rows(), n_col = network->layers[1].weights.cols();
+  Matrix *layer2_out = matrix_multiplication(a_row, b_col, n_row, n_col, layer1_out, &network->layers[1].weights, arena);
+  std::cout << "Third matmul\n";
+  n_row = network->layers[2].weights.rows();
+  b_col = network->layers[2].weights.cols();
+  Matrix *result = matrix_multiplication(a_row, n_col, n_row, b_col, layer2_out, &network->layers[2].weights, arena);
+  
+  Matrix *output = new_matrix(input_size, 1);
+  dim3 grid_out((output->cols() + blocks.x - 1) / blocks.x, (output->rows() + blocks.y - 1) / blocks.y);
+
+  convert_temporary_matrix<<<grid_out, blocks, 0, arena.get_stream()>>>(output, result); 
   cudaDeviceSynchronize();
 
-  scale_matrix<<<grid, blocks>>>(B, 3.0); 
-  A = transpose_matrix(A);
+  // Reset arena
+  arena.reset();
 
-  cudaDeviceSynchronize();
-  Matrix *C = matrix_multiplication(A, B);
-
-  // Chain complex operation for complexity
-  A = transpose_matrix(A);
-  matrix_elementwise_operation(B, A, Hadamard);
-  A = transpose_matrix(A);
-  Matrix *D = matrix_multiplication(A, B);
-  matrix_elementwise_operation(C, D, Sub);
-
-  // Prefetch back to cpu
-  cudaMemPrefetchAsync(C, sizeof(Matrix), cudaCpuDeviceId);
-  cudaMemPrefetchAsync(C->data, sizeof(float) * C->rows() * C->cols(), cudaCpuDeviceId);
-  cudaDeviceSynchronize();
-
-  // print result 
-  for (int i = 0; i < C->cols(); i++) {
-    std::cout << "[";
-    for (int j = 0; j < C->rows(); j++) {
-      std::cout << " " << C->data[i * size + j]; 
+  // Print output 
+  for (int i = 0; i < output->cols(); i++) {
+    std::cout << "[ ";
+    for (int j = 0; j < output->rows(); j++) {
+      std::cout << output->data[i * output->rows() + j] << " ";
     }
     std::cout << "]\n";
   }
 
-  cudaFree(A);
-  cudaFree(B);
-  cudaFree(C);
-  cudaFree(a_vec);
-  cudaFree(b_vec);
+  std::cout << "Network Created\n";
+
+  cudaFree(network);
+  cudaFree(input_mat->data);
+  cudaFree(input_mat);
+  cudaFree(input);
 
   return 0;
 }

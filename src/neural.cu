@@ -1,13 +1,18 @@
 #include "../include/neural.hpp"
-#include <random>
+#include <cuda_runtime_api.h>
+#include <driver_types.h>
+
+// #define __debug
+
 // Matrix Kernels/Functions for GPU. 
 __host__ Matrix *new_matrix(int rows, int cols) {
   // Uncasted pointer and size of memory  
   void *full_ptr;
   uint64_t size = sizeof(Matrix) + (rows * cols* sizeof(float));
-
   // Create memory for entire matrix block as contiguous 
+  // Why the fuck is this failing
   cudaMallocManaged(&full_ptr, size);
+
   Matrix *result = static_cast<Matrix*>(full_ptr);
   result->data = reinterpret_cast<float*>(result + 1);
   result->row = rows;
@@ -15,6 +20,9 @@ __host__ Matrix *new_matrix(int rows, int cols) {
 
   // Prefetch Memory to GPU 
   cudaMemPrefetchAsync(result, size, cudaMemAdviseSetAccessedBy, 0);
+#ifdef __debug
+    std::cout << "Created New Matrix\n";
+#endif
   return result;
 }
 
@@ -22,19 +30,23 @@ __host__ Matrix *new_matrix(int rows, int cols) {
 
 // Fill matrix with vector, assertion of comparable size happens prior to call
 __global__ void fill_matrix(Matrix *matrix, float *vector) {
-  const uint x = blockIdx.x * BLOCKSIZE + (threadIdx.x / BLOCKSIZE);
-  const uint y = blockIdx.y * BLOCKSIZE + (threadIdx.x % BLOCKSIZE);
+  const uint x = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint y = blockIdx.y * blockDim.y + threadIdx.y;
 
   if ( x < matrix->cols() && y < matrix->rows() ) {
     // Fill in correct place in memory
-    matrix->data[x * matrix->rows() + y] = vector[x * matrix->rows() + y];  
+    const uint index = y * matrix->cols() + x;
+#ifdef __debug
+    printf("(%u, %u): %u\n", x, y, index);
+#endif
+    matrix->data[index] = vector[index];  
   }
 } 
 
 // Scales each value in matrix by some scalar float 
 __global__ void scale_matrix(Matrix *matrix, float scalar) {
-  const uint x = blockIdx.x * BLOCKSIZE + (threadIdx.x / BLOCKSIZE);
-  const uint y = blockIdx.y * BLOCKSIZE + (threadIdx.x % BLOCKSIZE);
+  const uint x = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint y = blockIdx.y * blockDim.y + threadIdx.y;
 
   if ( x < matrix->cols() && y < matrix->rows() ) {
     matrix->data[x * matrix->rows() + y] *= scalar;  
@@ -94,8 +106,8 @@ __host__ Matrix *transpose_matrix(Matrix *a) {
 template <typename F> 
 __global__ static void matrix_element_operation_kernel(Matrix *matrix, const Matrix *addend, F op) {
   // Collect column and row indexes 
-  const uint col = blockIdx.x * BLOCKSIZE + (threadIdx.x / BLOCKSIZE);
-  const uint row = blockIdx.y * BLOCKSIZE + (threadIdx.x % BLOCKSIZE);
+  const uint col = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint row = blockIdx.y * blockDim.y + threadIdx.y;
 
   const int m_row = matrix->rows(), m_col = matrix->cols();
   const int a_row = addend->rows(), a_col = addend->cols();
@@ -225,22 +237,70 @@ __global__ static void matrix_multiplication_kernel(Matrix *C, const Matrix *A, 
   }
 }
 
+__global__ static void set_matrix_kernel(Matrix *M, uint row, uint col, float *data) {
+  M->row  = row;
+  M->col  = col; 
+  M->data = data; 
+}
+
+__global__ void convert_temporary_matrix(Matrix *U, Matrix *temp) {
+  if (threadIdx.x == 0 && threadIdx.y == 0) {
+    U->row = temp->rows();
+    U->col = temp->cols();
+  }
+
+  const uint x = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint y = blockIdx.y * blockDim.y + threadIdx.y;
+
+  const uint col = temp->cols(), row = temp->rows();
+
+  if (x < col && y < row) {
+    const uint index = y * col + x;
+    U->data[index] = temp->data[index];
+  }
+}
+
+// Creates a tempory matrix using arena allocator 
+__host__ static Matrix *new_temporary_matrix(ArenaAllocator &arena, uint row, uint col) {
+
+  // Call arena for memory
+  uint64_t matrix_size = sizeof(Matrix) + (col * row * sizeof(float));
+  Matrix *M = static_cast<Matrix*>(arena.allocate(matrix_size));
+
+  std::cout << "Arena Allocated Size: " << matrix_size << " to M\n";
+
+  // Assert ptr is non-null
+  assert(M != nullptr);
+
+  // Initialize metadata
+  set_matrix_kernel<<<1, 1, 0, arena.get_stream()>>>(M, row, col, reinterpret_cast<float*>(M + 1));
+
+  // Return pointer
+  return M;
+}
+
 // Call to matmul. Returns new sized matrix C
-__host__ Matrix *matrix_multiplication(Matrix *A, Matrix *B) {
+// Since temporary matrices will be isolated to GPU we want to avoid dereferences. 
+// The sizes of temporary matrices will be known and therefore can be passed as args 
+__host__ Matrix *matrix_multiplication(uint A_row, uint A_col, uint B_row, uint B_col, Matrix *A, Matrix *B, ArenaAllocator &arena) {
 
-  const uint A_row = A->rows(), A_col = A->cols();
-  const uint B_row = B->rows(), B_col = B->cols();
-
-  // Assert inner sizes match
   assert(A_col == B_row);
-  
+
+  Matrix *C = new_temporary_matrix(arena, A_row, B_col);
+  std::cout << "Allocated C from arena allocator\n";
+
   dim3 block(BLOCKSIZE, BLOCKSIZE);
   dim3 grid((B_col + BLOCKSIZE - 1) / BLOCKSIZE, (A_row + BLOCKSIZE - 1) / BLOCKSIZE);
 
-  Matrix *C = new_matrix(A_row, B_col);
   cudaMemset(C->data, 0, A_row * B_col * sizeof(float));
   matrix_multiplication_kernel<<<grid, block>>>(C, A, B);
-  cudaDeviceSynchronize();
+  cudaError_t err = cudaDeviceSynchronize();
+  std::cout << "matmul kernel complete\n";
+  if (err != cudaSuccess) {
+    std::cerr << "matmul sync error: " << cudaGetErrorString(err) << '\n';
+    exit(EXIT_FAILURE);
+  }
+  cudaStreamSynchronize(arena.get_stream());
 
   return C;
 }
@@ -266,62 +326,159 @@ __host__ void activate(Matrix *A, ActivationFunction fn) {
   cudaDeviceSynchronize();
 }
 
-__host__ Layer *new_layer(uint current_size, uint previous_size, Activation function, ActivationTypes type) {
-  Layer *L;
+// Initialize the weights and biases for a layer depending on its activation function
+__host__ static void initialize_layer(Layer *layer) {
 
+  const uint col = layer->weights.cols();
+  const uint row = layer->weights.rows();
+
+  // Set grid/block sizes for kernel launch
   dim3 blocks(BLOCKSIZE, BLOCKSIZE);
-  dim3 grid((current_size + BLOCKSIZE - 1) / BLOCKSIZE, (previous_size + BLOCKSIZE - 1) / BLOCKSIZE);
-
+  dim3 grid((col + BLOCKSIZE - 1) / BLOCKSIZE, (row + BLOCKSIZE - 1) / BLOCKSIZE);
   std::random_device rd;
   std::mt19937 gen(rd());
   float uniform_range = 0.0;
   float *weight_init, *bias_init;
 
-  void *full;
-  uint64_t size = sizeof(Layer) + ((previous_size * current_size * sizeof(float)) + current_size * sizeof(float)); 
-  
-  cudaMallocManaged(&full, size);
-  L = static_cast<Layer*>(full);
-  L->weights  = reinterpret_cast<Matrix*>(L + 1);
-  L->biases   = reinterpret_cast<Matrix*>(L + 2);
-  L->function = function;
-
   // Determine the type 
-  switch (type) {
+  switch (layer->function.type) {
     case Tanh:
     case Sigmoid:
     default:
-      uniform_range = sqrtf(6.0 / static_cast<float>(current_size + previous_size));
+      uniform_range = sqrtf(6.0 / static_cast<float>(col + row));
       break;
     case Leakyrelu:
     case Relu:
     case Elu:
-      uniform_range = sqrtf(2.0 / static_cast<float>(previous_size)); 
+      uniform_range = sqrtf(2.0 / static_cast<float>(row)); 
       break;
   }
 
   std::uniform_real_distribution<> distribution(-uniform_range, uniform_range);
   
-  cudaMallocManaged(&weight_init, sizeof(float) * previous_size * current_size);
-  cudaMallocManaged(&bias_init, sizeof(float) * current_size);
-
-  for (int i = 0; i < current_size; i++) {
-    for (int j = 0; j < previous_size; j++) {
-      weight_init[i * previous_size + j] = distribution(gen); 
-      bias_init[i] = distribution(gen);
+  // Create vectors of initial values for weights and biases 
+  cudaMallocManaged(&weight_init, sizeof(float) * row * col);
+  cudaMallocManaged(&bias_init, sizeof(float) * col);
+  for (int i = 0; i < col; i++) {
+    for (int j = 0; j < row; j++) {
+      weight_init[i * row + j] = distribution(gen); 
+      bias_init[i] = 1e-3;
     }
   }
 
-  fill_matrix<<<grid, blocks>>>(W, weight_init);
-  fill_matrix<<<grid, blocks>>>(B, bias_init);
+  cudaMemPrefetchAsync(weight_init, sizeof(float) * row * col, 0);
+  cudaMemPrefetchAsync(bias_init, sizeof(float) * col, 0);
   cudaDeviceSynchronize();
 
-  return L;
+  // Fill matrices with initializing values
+  fill_matrix<<<grid, blocks>>>(&layer->weights, weight_init);
+  fill_matrix<<<grid, blocks>>>(&layer->biases, bias_init);
+  cudaDeviceSynchronize();
+}
+
+// Layer sizes is one longer than layer count 
+__host__ static size_t calculate_network_size(uint *layer_sizes, uint layer_count, uint input_size) {
+   
+  // Find size of metadata
+  uint64_t total_size = sizeof(Network);            // Network metadata
+  total_size += sizeof(Layer) * layer_count;        // Layer metadata 
+  total_size += sizeof(uint) * (layer_count + 1);   // Sizes array 
+  total_size += sizeof(Matrix) * (layer_count + 1); // Activation array metadata
+
+  // Iterate over each discrete layer
+  for (uint i = 0; i < layer_count; i++) {
+    // Find current and previous neuron counts from array
+    uint previous_size = layer_sizes[i];
+    uint current_size  = layer_sizes[i + 1];
+
+    // Calculate memory for weights and biases ( and each activation )
+    uint64_t weights_data    = (previous_size * current_size) * sizeof(float);
+    uint64_t bias_data       = (current_size) * sizeof(float);
+    uint64_t activation_data = (input_size * current_size) *sizeof(float); 
+
+    // Sum
+    total_size += activation_data + weights_data + bias_data; 
+  }
+
+  return total_size;
 }
 
 // Takes array of sizes and array of Activation functions 
-__host__ Network *new_network(uint *sizes, Activation *funcs, ActivationTypes *type) {
-  Network *N;
+__host__ Network *new_network(
+  uint *layer_sizes,
+  uint layer_count,
+  uint input_size,
+  std::vector<Activation> funcs
+) {
+  Network *network;
+  const uint64_t total_size = calculate_network_size(layer_sizes, layer_count, input_size);
+  cudaMallocManaged(&network, total_size);
 
-  return N;
+  // Reinterpret initial cast to grab pointers to metadata
+  network->layers      = reinterpret_cast<Layer*>(network + 1);
+  network->activations = reinterpret_cast<Matrix*>(network->layers + layer_count);
+  network->sizes       = reinterpret_cast<int*>(network->activations + layer_count + 1);
+  network->layer_count = layer_count; 
+  
+  for (int i = 0; i <= layer_count; i++) {
+    network->sizes[i] = layer_sizes[i];
+  }
+  
+  // Cast address into uint64_t type 
+  uint64_t pointer_offset = (uint64_t)(network->sizes + layer_count + 1);
+
+  // Provide ownership to pointers for each Layer
+  for (int i = 0; i < layer_count; i++) {
+    const uint previous_size = layer_sizes[i];
+    const uint current_size  = layer_sizes[i + 1];
+
+    // Set weights metadata and collect location of data pointer from offset 
+    network->layers[i].weights.row  = previous_size;
+    network->layers[i].weights.col  = current_size; 
+    network->layers[i].weights.data = (float*)pointer_offset;
+    pointer_offset += static_cast<uint64_t>(sizeof(float) * previous_size * current_size);
+
+    // Set bias metadata and collect location of data pointer from offset 
+    network->layers[i].biases.row   = 1;
+    network->layers[i].biases.col   = current_size;
+    network->layers[i].biases.data  = (float*)pointer_offset;
+    pointer_offset += static_cast<uint64_t>(sizeof(float) * current_size);
+
+    // Set layers function 
+    network->layers[i].function = funcs[i];
+    
+    initialize_layer(&network->layers[i]);
+  }
+
+  // Pointer offset is onto activations now so the array's metadata can be set 
+  for (int i = 0; i <= layer_count; i++) {
+    uint current_size = layer_sizes[i];
+
+    network->activations[i].row  = current_size;
+    network->activations[i].col  = input_size;
+    network->activations[i].data = (float*)pointer_offset;
+    pointer_offset += static_cast<uint64_t>(sizeof(float) * current_size * input_size);
+  }
+
+  // Send network to GPU. It should not return till free
+  cudaError_t err = cudaMemPrefetchAsync(network, total_size, 0);
+  if (err != cudaSuccess) {
+    std::cerr << "Prefetch Error: " << cudaGetErrorString(err) << '\n';
+    exit(EXIT_FAILURE);
+  }
+  return network;
 }
+
+// Forward Propagation through a network,
+// The idea is that all data MUST be allocated prior to call and passed as args 
+// Therefore we have Z, A as arrays and must be allocated to the expected size 
+// beforehand to mitigate expected overhead from calling malloc/free several thousand times
+
+__host__ void forward_propagation(
+  Matrix *input,
+  Matrix *output,
+  Matrix *Z,
+  Matrix *A
+) {
+
+} 

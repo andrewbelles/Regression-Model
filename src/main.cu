@@ -10,13 +10,13 @@ int main(int argc, char *argv[]) {
   std::uniform_real_distribution<> distribution(-5.0, 5.0);
 
   // Compute at compile time 
-  constexpr int size = 128;
+  constexpr int size = 256;
   constexpr dim3 blocks(16, 16);
   constexpr dim3 grid((size + blocks.x - 1) / blocks.x, (size + blocks.y) / blocks.y);
 
   // Generate Unified Memory for Matrices 
-  Matrix *A = new_matrix(size, 1); 
-  Matrix *B = new_matrix(size, 1);  
+  Matrix *A = new_matrix(size, size); 
+  Matrix *B = new_matrix(size, size);  
 
   // Vectors to fill matrices
   float *a_vec, *b_vec;
@@ -26,18 +26,16 @@ int main(int argc, char *argv[]) {
   cudaMallocManaged(&b_vec, sizeof(float) * size);
 
   // Fill with random values  
-  for (int i = 0; i < size; i++) {
+  for (int i = 0; i < size * size; i++) {
     a_vec[i] = distribution(gen);
     b_vec[i] = distribution(gen);
   }
 
-  std::cout << "Filled array completing Prefetch\n";
-
   // Send data to gpu 
   cudaMemPrefetchAsync(A, sizeof(Matrix), 0);
   cudaMemPrefetchAsync(B, sizeof(Matrix), 0);
-  cudaMemPrefetchAsync(a_vec, sizeof(float) * size * 1, 0);
-  cudaMemPrefetchAsync(b_vec, sizeof(float) * size * 1, 0);
+  cudaMemPrefetchAsync(a_vec, sizeof(float) * size * size, 0);
+  cudaMemPrefetchAsync(b_vec, sizeof(float) * size * size, 0);
   cudaDeviceSynchronize();
 
   // Fill matrices with data
@@ -47,17 +45,21 @@ int main(int argc, char *argv[]) {
 
   scale_matrix<<<grid, blocks>>>(B, 3.0); 
   A = transpose_matrix(A);
-  std::cout << "Transpose and Scale\n";
 
   cudaDeviceSynchronize();
-  std::cout << "Call to Matrix C\n";
   Matrix *C = matrix_multiplication(A, B);
+
+  // Chain complex operation for complexity
+  A = transpose_matrix(A);
+  matrix_elementwise_operation(B, A, Hadamard);
+  A = transpose_matrix(A);
+  Matrix *D = matrix_multiplication(A, B);
+  matrix_elementwise_operation(C, D, Sub);
 
   // Prefetch back to cpu
   cudaMemPrefetchAsync(C, sizeof(Matrix), cudaCpuDeviceId);
   cudaMemPrefetchAsync(C->data, sizeof(float) * C->rows() * C->cols(), cudaCpuDeviceId);
-
-  std::cout << "Completed mul and prefetch: " << C->rows() << '\n';
+  cudaDeviceSynchronize();
 
   // print result 
   for (int i = 0; i < C->cols(); i++) {

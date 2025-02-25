@@ -1,5 +1,5 @@
 #include "../include/neural.hpp"
-
+#include <random>
 // Matrix Kernels/Functions for GPU. 
 __host__ Matrix *new_matrix(int rows, int cols) {
   // Uncasted pointer and size of memory  
@@ -22,33 +22,33 @@ __host__ Matrix *new_matrix(int rows, int cols) {
 
 // Fill matrix with vector, assertion of comparable size happens prior to call
 __global__ void fill_matrix(Matrix *matrix, float *vector) {
-  int col = blockIdx.x * blockDim.x + threadIdx.x;
-  int row = blockIdx.y * blockDim.y + threadIdx.y;
+  const uint x = blockIdx.x * BLOCKSIZE + (threadIdx.x / BLOCKSIZE);
+  const uint y = blockIdx.y * BLOCKSIZE + (threadIdx.x % BLOCKSIZE);
 
-  if ( col < matrix->cols() && row < matrix->rows() ) {
+  if ( x < matrix->cols() && y < matrix->rows() ) {
     // Fill in correct place in memory
-    matrix->data[col * matrix->rows() + row] = vector[col * matrix->rows() + row];  
+    matrix->data[x * matrix->rows() + y] = vector[x * matrix->rows() + y];  
   }
 } 
 
 // Scales each value in matrix by some scalar float 
 __global__ void scale_matrix(Matrix *matrix, float scalar) {
-  int col = blockIdx.x * blockDim.x + threadIdx.x;
-  int row = blockIdx.y * blockDim.y + threadIdx.y;
+  const uint x = blockIdx.x * BLOCKSIZE + (threadIdx.x / BLOCKSIZE);
+  const uint y = blockIdx.y * BLOCKSIZE + (threadIdx.x % BLOCKSIZE);
 
-  if ( col < matrix->cols() && row < matrix->rows() ) {
-    matrix->data[col * matrix->rows() + row] *= scalar;  
+  if ( x < matrix->cols() && y < matrix->rows() ) {
+    matrix->data[x * matrix->rows() + y] *= scalar;  
   }
 }
 
 // Transposition of matrix using shared memory blocks into matrix without copying  
 // -- Efficient Transpose Mike Harris
-__global__ static void transpose_matrix_kernel(Matrix *matrix, Matrix *result) {
+__global__ static void transpose_matrix_kernel(Matrix *a, Matrix *aT) {
   // Shared memory is coalesced. BLOCKSIZE + 1 is to resolve bank conflicts from 32x32
   __shared__ float tile[BLOCKSIZE][BLOCKSIZE+1];
 
-  const uint m_row = matrix->rows(), m_col = matrix->cols();
-  const uint r_row = result->rows(), r_col = result->cols();
+  const uint a_row = a->rows(), a_col  = a->cols();
+  const uint t_row = aT->rows(), t_col = aT->cols();
 
   // Pull x and y indices from block/thread idx
   int x = blockIdx.x * BLOCKSIZE + threadIdx.x;
@@ -56,22 +56,18 @@ __global__ static void transpose_matrix_kernel(Matrix *matrix, Matrix *result) {
 
   // Copy data into shared memory
   for (int i = 0; i < BLOCKSIZE; i += BLOCKROWS) {
-    if (x < m_col && (y + i) < m_row) {
-      tile[threadIdx.y + i][threadIdx.x] = matrix->data[x * m_row + (y + i)];
+    if (x < a_col && (y + i) < a_row) {
+      tile[threadIdx.y + i][threadIdx.x] = a->data[x * a_row + (y + i)];
     }
   }
 
   // Wait for all threads to put data in shared memory
   __syncthreads();
-
-  // Get new x and y indices
-  x = blockIdx.y * BLOCKSIZE + threadIdx.x;
-  y = blockIdx.x * BLOCKSIZE + threadIdx.y;
-
+  
   // Fill result matrix with data from shared memory
   for (int i = 0; i <  BLOCKSIZE; i += BLOCKROWS) {
-    if ((threadIdx.y + i) < BLOCKSIZE && (y + i)) {
-      result->data[(y + i) * r_col + x] = tile[threadIdx.x][(threadIdx.y + i)];
+    if ((threadIdx.y + i) < BLOCKSIZE && (y + i) < BLOCKSIZE) {
+      aT->data[(y + i) * t_col + x] = tile[threadIdx.x][(threadIdx.y + i)];
     }
   }
 }
@@ -98,8 +94,8 @@ __host__ Matrix *transpose_matrix(Matrix *a) {
 template <typename F> 
 __global__ static void matrix_element_operation_kernel(Matrix *matrix, const Matrix *addend, F op) {
   // Collect column and row indexes 
-  int row = threadIdx.y + blockIdx.y * blockDim.y;
-  int col = threadIdx.x + blockIdx.x * blockDim.x;
+  const uint col = blockIdx.x * BLOCKSIZE + (threadIdx.x / BLOCKSIZE);
+  const uint row = blockIdx.y * BLOCKSIZE + (threadIdx.x % BLOCKSIZE);
 
   const int m_row = matrix->rows(), m_col = matrix->cols();
   const int a_row = addend->rows(), a_col = addend->cols();
@@ -120,13 +116,13 @@ __global__ static void matrix_element_operation_kernel(Matrix *matrix, const Mat
 }
 
 // Performs an element wise operation between two matrices 
-__host__ void matrix_elementwise_operation(Matrix *matrix, Matrix *addend, int op_index) {
+__host__ void matrix_elementwise_operation(Matrix *matrix, Matrix *addend, ElementOperations op) {
   // Collect row and column counts 
   const int m_row = matrix->rows(), m_col = matrix->cols();
   const int a_row = addend->rows(), a_col = addend->cols();
 
   // Check add and subtract bounding 
-  if (op_index != 2) {
+  if (op == Hadamard) {
     assert((a_col == 1 || m_col == a_col) && (a_row == 1 || m_row == a_row));  
   }
 
@@ -135,16 +131,16 @@ __host__ void matrix_elementwise_operation(Matrix *matrix, Matrix *addend, int o
   dim3 grid((m_col + block.x - 1) / block.x, (m_row + block.y - 1) / block.y);
 
   // Run specified elementwise operation 
-  switch (op_index) {
-    case 0:
+  switch (op) {
+    case Add:
       matrix_element_operation_kernel<<<grid, block>>>(matrix, addend,
         [] __device__ (float a, float b) {return a + b; });
       break;
-    case 1:
+    case Sub:
       matrix_element_operation_kernel<<<grid, block>>>(matrix, addend,
         [] __device__ (float a, float b) {return a - b; });
       break;
-    case 2:
+    case Hadamard:
       // Hadamard Requires more stringent bounding 
       assert(m_row == a_row && m_col == a_col);
       matrix_element_operation_kernel<<<grid, block>>>(matrix, addend,
@@ -229,10 +225,12 @@ __global__ static void matrix_multiplication_kernel(Matrix *C, const Matrix *A, 
   }
 }
 
+// Call to matmul. Returns new sized matrix C
 __host__ Matrix *matrix_multiplication(Matrix *A, Matrix *B) {
 
-  const int A_row = A->rows(), A_col = A->cols();
-  const int B_row = B->rows(), B_col = B->cols();
+  const uint A_row = A->rows(), A_col = A->cols();
+  const uint B_row = B->rows(), B_col = B->cols();
+
   // Assert inner sizes match
   assert(A_col == B_row);
   
@@ -245,4 +243,85 @@ __host__ Matrix *matrix_multiplication(Matrix *A, Matrix *B) {
   cudaDeviceSynchronize();
 
   return C;
+}
+
+// Neural Network Operations 
+
+// Accelerated activation
+__global__ static void activate_kernel(Matrix *A, ActivationFunction fn) {
+  const uint x = blockIdx.x * BLOCKSIZE + (threadIdx.x / BLOCKSIZE);
+  const uint y = blockIdx.y * BLOCKSIZE + (threadIdx.x % BLOCKSIZE);
+  
+  A->data[x * A->rows() + y] = fn(A->data[x * A->rows() + y]);
+}
+
+// Call to activate kernel using function passed as argument 
+__host__ void activate(Matrix *A, ActivationFunction fn) {
+
+  dim3 blocks(BLOCKSIZE, BLOCKSIZE);
+  dim3 grid((A->cols() + BLOCKSIZE - 1) / BLOCKSIZE, (A->rows() + BLOCKSIZE - 1) / BLOCKSIZE);
+
+  // Call to kernel 
+  activate_kernel<<<grid, blocks>>>(A, fn);
+  cudaDeviceSynchronize();
+}
+
+__host__ Layer *new_layer(uint current_size, uint previous_size, Activation function, ActivationTypes type) {
+  Layer *L;
+
+  dim3 blocks(BLOCKSIZE, BLOCKSIZE);
+  dim3 grid((current_size + BLOCKSIZE - 1) / BLOCKSIZE, (previous_size + BLOCKSIZE - 1) / BLOCKSIZE);
+
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  float uniform_range = 0.0;
+  float *weight_init, *bias_init;
+
+  void *full;
+  uint64_t size = sizeof(Layer) + ((previous_size * current_size * sizeof(float)) + current_size * sizeof(float)); 
+  
+  cudaMallocManaged(&full, size);
+  L = static_cast<Layer*>(full);
+  L->weights  = reinterpret_cast<Matrix*>(L + 1);
+  L->biases   = reinterpret_cast<Matrix*>(L + 2);
+  L->function = function;
+
+  // Determine the type 
+  switch (type) {
+    case Tanh:
+    case Sigmoid:
+    default:
+      uniform_range = sqrtf(6.0 / static_cast<float>(current_size + previous_size));
+      break;
+    case Leakyrelu:
+    case Relu:
+    case Elu:
+      uniform_range = sqrtf(2.0 / static_cast<float>(previous_size)); 
+      break;
+  }
+
+  std::uniform_real_distribution<> distribution(-uniform_range, uniform_range);
+  
+  cudaMallocManaged(&weight_init, sizeof(float) * previous_size * current_size);
+  cudaMallocManaged(&bias_init, sizeof(float) * current_size);
+
+  for (int i = 0; i < current_size; i++) {
+    for (int j = 0; j < previous_size; j++) {
+      weight_init[i * previous_size + j] = distribution(gen); 
+      bias_init[i] = distribution(gen);
+    }
+  }
+
+  fill_matrix<<<grid, blocks>>>(W, weight_init);
+  fill_matrix<<<grid, blocks>>>(B, bias_init);
+  cudaDeviceSynchronize();
+
+  return L;
+}
+
+// Takes array of sizes and array of Activation functions 
+__host__ Network *new_network(uint *sizes, Activation *funcs, ActivationTypes *type) {
+  Network *N;
+
+  return N;
 }

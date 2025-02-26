@@ -1,6 +1,7 @@
 #ifndef __NEURAL_HPP__
 #define __NEURAL_HPP__
 
+
 #include <cuda_runtime.h> 
 #include <assert.h>
 #include <cstdint>
@@ -9,8 +10,10 @@
 #include <iostream>
 #include "../include/cuda_arena.hpp"
 
+
 #define BLOCKSIZE 16 
 #define BLOCKROWS 8
+
 
 enum ElementOperations {
   Hadamard,
@@ -26,6 +29,9 @@ enum ActivationTypes {
   Sigmoid,
 };
 
+// Function pointer to activation functions (On device)
+typedef __device__ float (*ActivationFunction)(float);
+
 // Column Major Matrix Implementation
 // Using C++ Linkage for Matrix so that we can attach cols() and rows() methods
 struct Matrix {
@@ -36,9 +42,6 @@ struct Matrix {
   __host__ __device__ int cols() const { return col; }
   __host__ __device__ int rows() const { return row; }
 };
-
-// Function pointer to activation functions (On device)
-typedef __device__ float (*ActivationFunction)(float);
 
 // Structure of function and its derivative 
 typedef struct {
@@ -75,5 +78,14 @@ __host__ Matrix *matrix_multiplication(
 );
 
 __host__ Network *new_network(uint *layer_sizes, uint layer_count, uint input_size, std::vector<Activation> funcs);
+
+__host__ Matrix *input_to_batch_array(
+  ArenaAllocator &arena,
+  float *input_vector,
+  uint64_t input_size,
+  uint feature_count,
+  uint *batch_count
+);
+
 
 #endif // __NEURAL_HPP__

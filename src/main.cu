@@ -1,11 +1,31 @@
 #include "../include/neural.hpp"
 #include "../include/cuda_arena.hpp"
+#include <cuda_runtime_api.h>
 #include <iostream>
 #include <random>
 #include <vector>
 
 float tanh_derivative(float x) {
   return 1.0 - (tanh(x) * tanh(x));
+}
+
+__global__ static void set_output_buffer(void *ptr, uint count, uint row, uint col) {
+  const uint idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  // If within valid idx 
+  if (idx < count) {
+    Matrix *buffer   = static_cast<Matrix*>(ptr);
+    uint64_t offset  = count * sizeof(Matrix) + (idx * row * col * sizeof(float));
+    buffer[idx].row  = row;
+    buffer[idx].col  = col;
+    buffer[idx].data = reinterpret_cast<float*>(static_cast<char*>(ptr) + offset); 
+  }
+}
+
+__global__ 
+
+__global__ static void calculate_output_buffer() {
+
 }
 
 int main(int argc, char *argv[]) {
@@ -23,7 +43,7 @@ int main(int argc, char *argv[]) {
 
   uint layer_sizes[] = {1,256,256,1};
   uint layer_count   = 3; 
-  uint input_size = 512;
+  uint input_size    = 2048;
   Activation tanac = {
     .f  = [](float x) -> float { return tanh(x); },
     .df = [](float x) -> float { return 1.0 - (tanh(x) * tanh(x)); },
@@ -35,64 +55,46 @@ int main(int argc, char *argv[]) {
     funcs.push_back(tanac);
   }
 
-  float *input;
-  cudaMallocManaged(&input, 512 * sizeof(float));
-  for (int i = 0; i < 512; i++) {
+  float *input = new float[input_size];
+  for (int i = 0; i < input_size; i++) {
     input[i] = distribution(gen); 
   }
 
-  // Fill matrix with values
-  Matrix *input_mat = new_matrix(input_size, 1);
-  
-  dim3 blocks(BLOCKSIZE, BLOCKSIZE);
-  dim3 grid((input_mat->cols() + blocks.x - 1) / blocks.x, (input_mat->rows() + blocks.y - 1) / blocks.y);
-
-  cudaMemPrefetchAsync(input_mat->data, sizeof(float) * input_mat->cols() * input_mat->rows(), 0);
-  cudaMemPrefetchAsync(input_mat, sizeof(Matrix), 0);
-  cudaMemPrefetchAsync(input, sizeof(float) * input_size, 0);
-
-  fill_matrix<<<grid, blocks>>>(input_mat, input);
-  cudaDeviceSynchronize();
-
   Network *network = new_network(layer_sizes, layer_count, input_size, funcs);
+  uint batch_count = 0;
+  Matrix *batches  = input_to_batch_array(arena, input, input_size, 1, &batch_count);
 
-  // Test matmul on layers between 
-  std::cout << "First matmul\n";
-
-  const uint a_row = input_mat->rows(), a_col = input_mat->cols();
-  uint b_row = network->layers[0].weights.rows(), b_col = network->layers[0].weights.cols();
-  Matrix *layer1_out = matrix_multiplication(a_row, a_col, b_row, b_col, input_mat, &network->layers[0].weights, arena);
-  std::cout << "Second matmul\n";
-  uint n_row = network->layers[1].weights.rows(), n_col = network->layers[1].weights.cols();
-  Matrix *layer2_out = matrix_multiplication(a_row, b_col, n_row, n_col, layer1_out, &network->layers[1].weights, arena);
-  std::cout << "Third matmul\n";
-  n_row = network->layers[2].weights.rows();
-  b_col = network->layers[2].weights.cols();
-  Matrix *result = matrix_multiplication(a_row, n_col, n_row, b_col, layer2_out, &network->layers[2].weights, arena);
-  
-  Matrix *output = new_matrix(input_size, 1);
-  dim3 grid_out((output->cols() + blocks.x - 1) / blocks.x, (output->rows() + blocks.y - 1) / blocks.y);
-
-  convert_temporary_matrix<<<grid_out, blocks, 0, arena.get_stream()>>>(output, result); 
+  // Multiply all batches by first layer and capture result in arena allocated arrays
+  // Total memory required for outputs
+  uint64_t size = (2048 / 64) * sizeof(Matrix) + (256 * 2048 * sizeof(float));
+  Matrix *outputs;
+  void *ptr;
+  cudaMallocManaged(&ptr, size);
+  cudaMemPrefetchAsync(ptr, size, 0);
   cudaDeviceSynchronize();
 
-  // Reset arena
-  arena.reset();
+  dim3 blocks(256);
+  dim3 grid((32 + blocks.x - 1) / blocks.x);
 
-  // Print output 
-  for (int i = 0; i < output->cols(); i++) {
-    std::cout << "[ ";
-    for (int j = 0; j < output->rows(); j++) {
-      std::cout << output->data[i * output->rows() + j] << " ";
-    }
-    std::cout << "]\n";
+  set_output_buffer<<<grid, blocks>>>(ptr, 32, 32, 256);
+  cudaDeviceSynchronize();
+
+  blocks = dim3(16, 16);
+  grid   = dim3((1 + blocks.x - 1) / blocks.x, (256 + blocks.y - 1) / blocks.y);
+  for (int i = 0; i < 32; i++) {
+    // Fetch temporary matrix holding result and copy into outputs array
+    Matrix *result = matrix_multiplication(32, 1, 1, 256, &batches[i], &network->layers[0].weights, arena);
+    convert_temporary_matrix<<<grid, blocks>>>(&outputs[i], result);
+    cudaDeviceSynchronize();
+    
+    // Reset arena each iteration 
+    arena.reset();
   }
 
-  std::cout << "Network Created\n";
-
+  std::cout << "Batch Count: " << batch_count << '\n';
   cudaFree(network);
-  cudaFree(input_mat->data);
-  cudaFree(input_mat);
+  cudaFree(batches);
+  cudaFree(outputs);
   cudaFree(input);
 
   return 0;

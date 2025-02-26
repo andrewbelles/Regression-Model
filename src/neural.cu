@@ -19,7 +19,7 @@ __host__ Matrix *new_matrix(int rows, int cols) {
   result->col = cols;
 
   // Prefetch Memory to GPU 
-  cudaMemPrefetchAsync(result, size, cudaMemAdviseSetAccessedBy, 0);
+  cudaMemPrefetchAsync(result, size, 0);
 #ifdef __debug
     std::cout << "Created New Matrix\n";
 #endif
@@ -238,9 +238,22 @@ __global__ static void matrix_multiplication_kernel(Matrix *C, const Matrix *A, 
 }
 
 __global__ static void set_matrix_kernel(Matrix *M, uint row, uint col, float *data) {
-  M->row  = row;
-  M->col  = col; 
-  M->data = data; 
+  if (threadIdx.x == 0 && threadIdx.y == 0) {
+    M->row  = row;
+    M->col  = col;
+    M->data = data;
+  }
+
+  // Ensure data ptr is set 
+  __syncthreads();
+
+  const uint x = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint y = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (x < col && y < row) {
+    const uint index = y * col + x;
+    M->data[index] = 0.0;
+  }
 }
 
 __global__ void convert_temporary_matrix(Matrix *U, Matrix *temp) {
@@ -273,7 +286,11 @@ __host__ static Matrix *new_temporary_matrix(ArenaAllocator &arena, uint row, ui
   assert(M != nullptr);
 
   // Initialize metadata
-  set_matrix_kernel<<<1, 1, 0, arena.get_stream()>>>(M, row, col, reinterpret_cast<float*>(M + 1));
+
+  dim3 blocks(BLOCKSIZE, BLOCKSIZE);
+  dim3 grid((col + BLOCKSIZE - 1) / BLOCKSIZE, (row + BLOCKSIZE - 1) / BLOCKSIZE);
+
+  set_matrix_kernel<<<grid, blocks, 0, arena.get_stream()>>>(M, row, col, reinterpret_cast<float*>(M + 1));
 
   // Return pointer
   return M;
@@ -292,8 +309,8 @@ __host__ Matrix *matrix_multiplication(uint A_row, uint A_col, uint B_row, uint 
   dim3 block(BLOCKSIZE, BLOCKSIZE);
   dim3 grid((B_col + BLOCKSIZE - 1) / BLOCKSIZE, (A_row + BLOCKSIZE - 1) / BLOCKSIZE);
 
-  cudaMemset(C->data, 0, A_row * B_col * sizeof(float));
-  matrix_multiplication_kernel<<<grid, block>>>(C, A, B);
+  matrix_multiplication_kernel<<<grid, block, 0, arena.get_stream()>>>(C, A, B);
+
   cudaError_t err = cudaDeviceSynchronize();
   std::cout << "matmul kernel complete\n";
   if (err != cudaSuccess) {
@@ -469,16 +486,109 @@ __host__ Network *new_network(
   return network;
 }
 
-// Forward Propagation through a network,
-// The idea is that all data MUST be allocated prior to call and passed as args 
-// Therefore we have Z, A as arrays and must be allocated to the expected size 
-// beforehand to mitigate expected overhead from calling malloc/free several thousand times
+// Efficient copy of memory from one source vector into N batch matrices
+// 3D launch configuration to allow for only one kernel call
+__global__ static void slice_input_vector(
+  Matrix *dests,
+  float *src,
+  uint batch_count,
+  uint batch_size,
+  uint feature_count
+) {
+  const uint block = blockIdx.z;
+  const uint x = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint y = blockIdx.y * blockDim.y + threadIdx.y;
+  
+  if (block >= batch_count) return;
 
+  // Pull batch for block thread is operating on 
+  Matrix *dest = &dests[block];
+
+  // Check in bounds and copy data 
+  if (x < dest->cols() && y < dest->rows()) {
+    uint src_index = block * batch_size * feature_count + y * feature_count + x;
+    dest->data[y * dest->cols() + x] = src[src_index];
+  }
+}
+
+// Takes some input vector and converts to N batch array of data split into sections. Forward pass will be a kernel operating on each batch(?)
+// Allocate on arena? I don't think so(?) I kind of want activations to be the compilation of batches in a nice shared memory type layout 
+__host__ Matrix *input_to_batch_array(
+  ArenaAllocator &arena,
+  float *input_vector,
+  uint64_t input_size,
+  uint feature_count,
+  uint *batch_count
+) {
+  const uint BATCHSIZE = 64; 
+  Matrix *batch_matrix;
+  arena.reset();  // Force a reset to arena to ensure enough space 
+
+  // Allocate memory on arena
+  float *d_inputs = static_cast<float*>(arena.allocate(input_size * sizeof(float)));
+  // Async call to copy data to input vector 
+  cudaMemcpyAsync(d_inputs, input_vector, input_size * sizeof(float), cudaMemcpyHostToDevice, arena.get_stream());
+
+  // Memory of input_matrix == batch_matrix 
+  // Compute memory cost for array of matrices
+
+  // Quotient + 1 will be allocated.
+  uint quotient = input_size / BATCHSIZE;
+  uint rem      = input_size % BATCHSIZE; 
+  quotient += (rem != 0) ? 1 : 0;
+
+  // Matrices will be BATCHSIZE x feature_count 
+  // Allocate data arrays contiguous to matrix array 
+  // Rem is just the row count of the batch, it'll be allocated to 32 byte aligned for simplicity
+  uint64_t matrix_size = sizeof(Matrix);
+  uint64_t matrix_data = (BATCHSIZE * feature_count) * sizeof(float);
+  uint64_t total_size  = quotient * (matrix_data + matrix_size);
+
+  // Allocate entire block
+  void *full_ptr;
+  cudaMallocManaged(&full_ptr, total_size);
+  // Fetch start 
+  batch_matrix = static_cast<Matrix*>(full_ptr);
+
+  for (int i = 0; i < quotient; i++) {
+    // Get offsets and pointer arithemetic/cast pointer to owner
+    uint64_t matrix_offset = i * (matrix_size + matrix_data);
+    Matrix *current_matrix = reinterpret_cast<Matrix*>(static_cast<char*>(full_ptr) + matrix_offset);
+    uint64_t data_offset   = matrix_offset + matrix_size;
+    float *current_data    = reinterpret_cast<float*>(static_cast<char*>(full_ptr) + data_offset);
+
+    // Copy metadata into current matrix 
+    current_matrix->row  = (rem != 0 && i == quotient - 1) ? rem : BATCHSIZE;
+    current_matrix->col  = feature_count;
+    current_matrix->data = current_data;
+
+    // Copy current matrix into batch array
+    batch_matrix[i] = *current_matrix;
+  }
+
+  // Fill calls
+  dim3 blocks(BLOCKSIZE, BLOCKSIZE);
+  dim3 grid;
+
+  // Ensure memory has been copied 
+  cudaDeviceSynchronize();
+
+  // Array slice loop 
+  grid = dim3((feature_count + BLOCKSIZE - 1) / BLOCKSIZE, (BATCHSIZE + BLOCKSIZE - 1) / BLOCKSIZE, quotient);
+  slice_input_vector<<<grid, blocks, 0, arena.get_stream()>>>(batch_matrix, d_inputs, quotient, BATCHSIZE, feature_count);
+
+  // Reset arena and prefetch the batch matrices to the gpu.
+  arena.reset();
+  cudaMemPrefetchAsync(batch_matrix, total_size, 0);
+
+  // Return batch array and update count
+  *batch_count = quotient;
+  return batch_matrix;
+}
+/*
 __host__ void forward_propagation(
   Matrix *input,
-  Matrix *output,
-  Matrix *Z,
-  Matrix *A
+  Matrix *output
 ) {
 
-} 
+} */

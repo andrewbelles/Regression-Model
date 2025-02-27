@@ -1,4 +1,5 @@
 #include "../include/neural.hpp"
+#include <cstdlib>
 #include <cuda_runtime_api.h>
 #include <driver_types.h>
 
@@ -128,11 +129,15 @@ __global__ static void matrix_element_operation_kernel(Matrix *matrix, const Mat
 }
 
 // Performs an element wise operation between two matrices 
-__host__ void matrix_elementwise_operation(Matrix *matrix, Matrix *addend, ElementOperations op) {
-  // Collect row and column counts 
-  const int m_row = matrix->rows(), m_col = matrix->cols();
-  const int a_row = addend->rows(), a_col = addend->cols();
-
+__host__ void matrix_elementwise_operation(
+  const int m_row,
+  const int m_col,
+  const int a_row,
+  const int a_col,
+  Matrix *matrix,
+  Matrix *addend,
+  ElementOperations op
+) {
   // Check add and subtract bounding 
   if (op == Hadamard) {
     assert((a_col == 1 || m_col == a_col) && (a_row == 1 || m_row == a_row));  
@@ -237,15 +242,16 @@ __global__ static void matrix_multiplication_kernel(Matrix *C, const Matrix *A, 
   }
 }
 
-__global__ static void set_matrix_kernel(Matrix *M, uint row, uint col, float *data) {
-  if (threadIdx.x == 0 && threadIdx.y == 0) {
+__global__ static void init_metadata_kernel(Matrix *M, uint row, uint col) {
     M->row  = row;
     M->col  = col;
-    M->data = data;
-  }
+    M->data = reinterpret_cast<float*>(reinterpret_cast<char*>(M) + sizeof(Matrix));
+}
 
-  // Ensure data ptr is set 
-  __syncthreads();
+// Has to be 1D block as syncthreads() only coordinates across a single block (?)
+__global__ static void set_matrix_kernel(Matrix *M) {
+
+  const uint col = M->cols(), row = M->rows();
 
   const uint x = blockIdx.x * blockDim.x + threadIdx.x;
   const uint y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -256,16 +262,14 @@ __global__ static void set_matrix_kernel(Matrix *M, uint row, uint col, float *d
   }
 }
 
+// This isn't how shared threads work remember
+// They only sync PER BLOCK. This is a 2D block config therefore it will not act how you expect
 __global__ void convert_temporary_matrix(Matrix *U, Matrix *temp) {
-  if (threadIdx.x == 0 && threadIdx.y == 0) {
-    U->row = temp->rows();
-    U->col = temp->cols();
-  }
+  uint col = temp->cols();
+  uint row = temp->rows();
 
   const uint x = blockIdx.x * blockDim.x + threadIdx.x;
   const uint y = blockIdx.y * blockDim.y + threadIdx.y;
-
-  const uint col = temp->cols(), row = temp->rows();
 
   if (x < col && y < row) {
     const uint index = y * col + x;
@@ -290,15 +294,25 @@ __host__ static Matrix *new_temporary_matrix(ArenaAllocator &arena, uint row, ui
   dim3 blocks(BLOCKSIZE, BLOCKSIZE);
   dim3 grid((col + BLOCKSIZE - 1) / BLOCKSIZE, (row + BLOCKSIZE - 1) / BLOCKSIZE);
 
-  set_matrix_kernel<<<grid, blocks, 0, arena.get_stream()>>>(M, row, col, reinterpret_cast<float*>(M + 1));
+  init_metadata_kernel<<<1, 1>>>(M, row, col);
+  cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    std::cerr << "Init sync error: " << cudaGetErrorString(err) << '\n';
+    exit(EXIT_FAILURE);
+  }
+
+  set_matrix_kernel<<<grid, blocks>>>(M);
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    std::cerr << "Set matrix sync error: " << cudaGetErrorString(err) << '\n';
+    exit(EXIT_FAILURE);
+  }
 
   // Return pointer
   return M;
 }
 
 // Call to matmul. Returns new sized matrix C
-// Since temporary matrices will be isolated to GPU we want to avoid dereferences. 
-// The sizes of temporary matrices will be known and therefore can be passed as args 
 __host__ Matrix *matrix_multiplication(uint A_row, uint A_col, uint B_row, uint B_col, Matrix *A, Matrix *B, ArenaAllocator &arena) {
 
   assert(A_col == B_row);
@@ -310,9 +324,7 @@ __host__ Matrix *matrix_multiplication(uint A_row, uint A_col, uint B_row, uint 
   dim3 grid((B_col + BLOCKSIZE - 1) / BLOCKSIZE, (A_row + BLOCKSIZE - 1) / BLOCKSIZE);
 
   matrix_multiplication_kernel<<<grid, block, 0, arena.get_stream()>>>(C, A, B);
-
   cudaError_t err = cudaDeviceSynchronize();
-  std::cout << "matmul kernel complete\n";
   if (err != cudaSuccess) {
     std::cerr << "matmul sync error: " << cudaGetErrorString(err) << '\n';
     exit(EXIT_FAILURE);
@@ -585,10 +597,66 @@ __host__ Matrix *input_to_batch_array(
   *batch_count = quotient;
   return batch_matrix;
 }
-/*
+
+__global__ void insert_output(Matrix *u_outputs, Matrix *d_output, uint i) {
+
+}
+
+// We don't want d_outputs until an output is to be read.
+// d_outputs is structured identical to u_batches but is allocated on arena 
 __host__ void forward_propagation(
-  Matrix *input,
-  Matrix *output
+  Network *network,
+  Matrix *u_batches,
+  Matrix *u_outputs,
+  ArenaAllocator &arena,
+  uint batch_count
 ) {
 
-} */
+  const int *sizes = network->get_sizes();
+  const uint layer_count = network->get_layer();
+  dim3 blocks, grid;
+
+  for (uint i = 0; i < layer_count; i++) {
+
+    // N number of threads each handle their own matrix ?
+    // "Naive" Implementation handles each batch 
+    for (uint batch = 0; batch < batch_count; batch++) {
+      
+      // Multiply by weights 
+      Matrix *current_input = &u_batches[i];
+      Matrix *d_output = matrix_multiplication(
+        current_input->rows(),
+        current_input->cols(),
+        sizes[i],
+        sizes[i+1],
+        current_input,
+        &network->layers[i].weights,
+        arena
+      );
+
+      // Add biases
+      matrix_elementwise_operation(
+        current_input->rows(),
+        sizes[i+1],
+        network->layers[i].biases.rows(),
+        network->layers[i].biases.cols(),
+        d_output,
+        &network->layers[i].biases,
+        Add
+      );
+
+      blocks = dim3(BLOCKSIZE, BLOCKSIZE); 
+      grid   = dim3( (current_input->rows() + blocks.x - 1) / blocks.x, (sizes[i+1] + blocks.y - 1) / blocks.y);
+
+      if (i == layer_count - 1) {
+
+      } else {
+        activate_kernel<<<grid, blocks>>>(d_output, network->layers[i].function.f);
+      }
+      
+      // Append d_output to u_outputs
+      insert_output<<<grid, blocks>>>(u_outputs, d_output, batch);
+    }
+  }
+
+}

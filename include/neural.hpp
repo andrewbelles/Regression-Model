@@ -62,6 +62,9 @@ struct Network {
   Matrix *activations;
   int layer_count;
   int *sizes;
+
+  __host__ __device__ int* get_sizes() const { return sizes; }
+  __host__ __device__ uint get_layer() const { return layer_count; }
 };
 
 // Visible Matrix Operations 

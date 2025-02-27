@@ -40,6 +40,8 @@ public:
   }
 
   cudaStream_t get_stream() const { return stream_; }
+  uint64_t get_size() const { return pool_size_; }
+  uint64_t get_remaining() { return pool_size_ - offset; }
 
   // Cannot copy arena (unique)
   ArenaAllocator(const ArenaAllocator&) = delete;

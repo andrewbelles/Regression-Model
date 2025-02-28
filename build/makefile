@@ -2,7 +2,7 @@
 
 # Compiler and flags
 NVCC = nvcc
-NVCC_FLAGS = -arch=sm_86 -O3 -g -std=c++11 -extended-lambda -lineinfo 
+NVCC_FLAGS = -arch=sm_86 -O3 -g -std=c++20 -extended-lambda -lineinfo 
 INCLUDE_FLAGS = -I../include
 LINK_FLAGS = -lcudart
 

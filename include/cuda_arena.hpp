@@ -3,6 +3,7 @@
 
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <iostream>
 
 // Arena allocator using cuda async memory operations 
   // Allocates the entire arena at the start of the program 

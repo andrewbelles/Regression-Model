@@ -24,7 +24,8 @@ enum ElementOperations {
 
 // Column Major Matrix Implementation
 // Using C++ Linkage for Matrix so that we can attach cols() and rows() methods
-struct alignas(32) Matrix {
+// Aligned to 16 bytes already 
+struct Matrix {
   float *data;
   int row;
   int col;

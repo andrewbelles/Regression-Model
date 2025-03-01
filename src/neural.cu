@@ -1,5 +1,7 @@
 #include "../include/neural.hpp"
+#include <cuda_device_runtime_api.h>
 #include <cuda_runtime_api.h>
+#include <driver_types.h>
 
 // #define __debug
 // Neural Network Operations 
@@ -37,9 +39,9 @@ __host__ static void initialize_layer(Layer *layer) {
   cudaMallocManaged(&weight_init, sizeof(float) * row * col);
   cudaMallocManaged(&bias_init, sizeof(float) * col);
   for (int i = 0; i < col; i++) {
+    bias_init[i] = 1e-4;
     for (int j = 0; j < row; j++) {
-      weight_init[i * row + j] = distribution(gen); 
-      bias_init[i] = 1e-3;
+      weight_init[j * row + i] = distribution(gen); 
     }
   }
 
@@ -60,7 +62,7 @@ __host__ static size_t calculate_network_size(uint *layer_sizes, uint layer_coun
   uint64_t total_size = sizeof(Network);            // Network metadata
   total_size += sizeof(Layer) * layer_count;        // Layer metadata 
   total_size += sizeof(uint) * (layer_count + 1);   // Sizes array 
-  total_size += sizeof(Matrix) * (layer_count); // Activation array metadata
+  total_size += sizeof(Matrix) * (layer_count + 1); // Activation array metadata
 
   // Iterate over each discrete layer
   for (uint i = 0; i < layer_count; i++) {
@@ -71,11 +73,13 @@ __host__ static size_t calculate_network_size(uint *layer_sizes, uint layer_coun
     // Calculate memory for weights and biases ( and each activation )
     uint64_t weights_data    = (previous_size * current_size) * sizeof(float);
     uint64_t bias_data       = (current_size) * sizeof(float);
-    uint64_t activation_data = (input_size * current_size) *sizeof(float); 
+    uint64_t activation_data = (input_size * current_size) * sizeof(float); 
 
     // Sum
     total_size += activation_data + weights_data + bias_data; 
   }
+
+  total_size += (input_size * layer_sizes[0]) * sizeof(float);
 
   return total_size;
 }
@@ -89,7 +93,11 @@ __host__ Network *new_network(
 ) {
   Network *network;
   const uint64_t total_size = calculate_network_size(layer_sizes, layer_count, input_size);
-  cudaMallocManaged(&network, total_size);
+  cudaError_t err = cudaMallocManaged(&network, total_size);
+  if (err != cudaSuccess) {
+    std::cerr << "Network Malloc Failure: " << cudaGetErrorString(err) << '\n';
+    return NULL;
+  }
 
   // Reinterpret initial cast to grab pointers to metadata
   network->layers      = reinterpret_cast<Layer*>(network + 1);
@@ -103,7 +111,7 @@ __host__ Network *new_network(
   }
   
   // Cast address into uint64_t type 
-  uint64_t pointer_offset = (uint64_t)(network->sizes + layer_count + 1);
+  uint64_t pointer_offset = reinterpret_cast<uint64_t>(network->sizes + layer_count + 1);
 
   // Provide ownership to pointers for each Layer
   for (int i = 0; i < layer_count; i++) {
@@ -114,13 +122,13 @@ __host__ Network *new_network(
     network->layers[i].weights.row  = previous_size;
     network->layers[i].weights.col  = current_size; 
     network->layers[i].weights.data = (float*)pointer_offset;
-    pointer_offset += static_cast<uint64_t>(sizeof(float) * previous_size * current_size);
+    pointer_offset += (sizeof(Matrix) + static_cast<uint64_t>(sizeof(float) * previous_size * current_size));
 
     // Set bias metadata and collect location of data pointer from offset 
     network->layers[i].biases.row   = 1;
     network->layers[i].biases.col   = current_size;
     network->layers[i].biases.data  = (float*)pointer_offset;
-    pointer_offset += static_cast<uint64_t>(sizeof(float) * current_size);
+    pointer_offset += (sizeof(Matrix) + static_cast<uint64_t>(sizeof(float) * current_size));
 
     // Set layers function 
     network->layers[i].type = types[i];
@@ -132,17 +140,17 @@ __host__ Network *new_network(
   for (int i = 0; i < layer_count; i++) {
     uint current_size = layer_sizes[i];
 
-    network->activations[i].row  = current_size;
-    network->activations[i].col  = input_size;
+    network->activations[i].row  = input_size;
+    network->activations[i].col  = current_size;
     network->activations[i].data = (float*)pointer_offset;
-    pointer_offset += static_cast<uint64_t>(sizeof(float) * current_size * input_size);
+    pointer_offset += (sizeof(Matrix) + static_cast<uint64_t>(sizeof(float) * current_size * input_size));
   }
 
   // Send network to GPU. It should not return till free
-  cudaError_t err = cudaMemPrefetchAsync(network, total_size, 0);
+  err = cudaMemPrefetchAsync(network, total_size, 0);
   if (err != cudaSuccess) {
     std::cerr << "Prefetch Error: " << cudaGetErrorString(err) << '\n';
-    exit(EXIT_FAILURE);
+    return NULL;
   }
   return network;
 }
@@ -154,26 +162,26 @@ __global__ static void slice_input_vector(
   float *src,
   uint batch_count,
   uint batch_size,
-  uint feature_count
+  uint feature_count,
+  uint64_t stride
 ) {
   const uint block = blockIdx.z;
+  if (block >= batch_count) return;
+
+  // Find starting memory location of matrix
+  Matrix *dest = reinterpret_cast<Matrix*>(reinterpret_cast<char*>(dests) + block * stride);
+
+  const uint col = dest->cols(), row = dest->rows();
   const uint x = blockIdx.x * blockDim.x + threadIdx.x;
   const uint y = blockIdx.y * blockDim.y + threadIdx.y;
   
-  if (block >= batch_count) return;
-
-  // Pull batch for block thread is operating on 
-  Matrix *dest = &dests[block];
-
   // Check in bounds and copy data 
-  if (x < dest->cols() && y < dest->rows()) {
+  if (x < col && y < row) {
     uint src_index = block * batch_size * feature_count + y * feature_count + x;
     dest->data[y * dest->cols() + x] = src[src_index];
   }
 }
 
-// Takes some input vector and converts to N batch array of data split into sections. Forward pass will be a kernel operating on each batch(?)
-// Allocate on arena? I don't think so(?) I kind of want activations to be the compilation of batches in a nice shared memory type layout 
 __host__ Matrix *input_to_batch_array(
   ArenaAllocator &arena,
   float *input_vector,
@@ -186,9 +194,13 @@ __host__ Matrix *input_to_batch_array(
   arena.reset();  // Force a reset to arena to ensure enough space 
 
   // Allocate memory on arena
-  float *d_inputs = static_cast<float*>(arena.allocate(input_size * sizeof(float)));
+  float *d_inputs = static_cast<float*>(arena.allocate(input_size * feature_count * sizeof(float)));
   // Async call to copy data to input vector 
-  cudaMemcpyAsync(d_inputs, input_vector, input_size * sizeof(float), cudaMemcpyHostToDevice, arena.get_stream());
+  cudaError_t err = cudaMemcpyAsync(d_inputs, input_vector, input_size * sizeof(float), cudaMemcpyHostToDevice, arena.get_stream());
+  if (err != cudaSuccess) {
+    std::cerr << "Memcpy Inputs to Device Failure: " << cudaGetErrorString(err) << '\n';
+    return NULL;
+  }
 
   // Memory of input_matrix == batch_matrix 
   // Compute memory cost for array of matrices
@@ -196,42 +208,32 @@ __host__ Matrix *input_to_batch_array(
   // Quotient + 1 will be allocated.
   uint quotient = input_size / BATCHSIZE;
   uint rem      = input_size % BATCHSIZE; 
-  quotient += (rem != 0) ? 1 : 0;
 
   // Matrices will be BATCHSIZE x feature_count 
   // Allocate data arrays contiguous to matrix array 
   // Rem is just the row count of the batch, it'll be allocated to 32 byte aligned for simplicity
   uint64_t matrix_size = sizeof(Matrix);
   uint64_t matrix_data = (BATCHSIZE * feature_count) * sizeof(float);
-  matrix_data = (matrix_data + 31) & ~31; // Ensure 32 byte aligned 
-  uint64_t total_size  = quotient * (matrix_data + matrix_size);
+  uint64_t total_size  = quotient * (matrix_data + matrix_size) + (rem * feature_count * sizeof(float) + matrix_size);
 
   // Allocate entire block
-  void *full_ptr;
-  cudaMallocManaged(&full_ptr, total_size);
+  err = cudaMallocManaged(&batch_matrix, total_size);
+  if (err != cudaSuccess) {
+    std::cerr << "Batch Matrix Malloc Failure: " << cudaGetErrorString(err) << '\n';
+    return NULL;
+  }
 
-  assert(reinterpret_cast<uint64_t>(full_ptr) % 32 == 0);
-
-  // Fetch start 
-  batch_matrix = static_cast<Matrix*>(full_ptr);
-
+  uint64_t offset = 0;
+  quotient += (rem != 0) ? 1 : 0;
   for (int i = 0; i < quotient; i++) {
-    // Get offsets and pointer arithemetic/cast pointer to owner
-    uint64_t matrix_offset = i * (matrix_size + matrix_data);
-    Matrix *current_matrix = reinterpret_cast<Matrix*>(static_cast<char*>(full_ptr) + matrix_offset);
-    uint64_t data_offset   = matrix_offset + matrix_size;
-    float *current_data    = reinterpret_cast<float*>(static_cast<char*>(full_ptr) + data_offset);
-
-    assert(reinterpret_cast<uint64_t>(current_matrix) % 32 == 0);
-    assert(reinterpret_cast<uint64_t>(current_data) % 32 == 0);
-
-    // Copy metadata into current matrix 
-    current_matrix->row  = (rem != 0 && i == quotient - 1) ? rem : BATCHSIZE;
-    current_matrix->col  = feature_count;
-    current_matrix->data = current_data;
-
-    // Copy current matrix into batch array
-    batch_matrix[i] = *current_matrix;
+    uint current_rows = (i == quotient - 1 && rem != 0) ? rem : BATCHSIZE;
+    Matrix* mat = reinterpret_cast<Matrix*>(reinterpret_cast<char*>(batch_matrix) + offset);
+    mat->row = current_rows;
+    mat->col = feature_count;
+    mat->data = reinterpret_cast<float*>(
+      reinterpret_cast<char*>(batch_matrix) + offset + sizeof(Matrix)
+    );
+    offset += sizeof(Matrix) + (current_rows * feature_count * sizeof(float));
   }
 
   // Fill calls
@@ -242,8 +244,9 @@ __host__ Matrix *input_to_batch_array(
   cudaDeviceSynchronize();
 
   // Array slice loop 
+  uint64_t stride = matrix_size + matrix_data;
   grid = dim3((feature_count + BLOCKSIZE - 1) / BLOCKSIZE, (BATCHSIZE + BLOCKSIZE - 1) / BLOCKSIZE, quotient);
-  slice_input_vector<<<grid, blocks, 0, arena.get_stream()>>>(batch_matrix, d_inputs, quotient, BATCHSIZE, feature_count);
+  slice_input_vector<<<grid, blocks, 0, arena.get_stream()>>>(batch_matrix, d_inputs, quotient, BATCHSIZE, feature_count, stride);
 
   // Reset arena and prefetch the batch matrices to the gpu.
   arena.reset();
@@ -261,8 +264,15 @@ __global__ void insert_output(Matrix *activation, Matrix *d_output, uint batch, 
   const uint x = blockIdx.x * blockDim.x + threadIdx.x;
   const uint y = blockIdx.y * blockDim.y + threadIdx.y;
   
+  // This is a 3d index retard. Should be a 2D index scaled to the start row of the batch 
+  assert(activation != nullptr);
+  assert(d_output != nullptr);
+
+  assert(activation->data != nullptr);
+  assert(d_output->data != nullptr);
+
   if (x < out_row && y < out_col) {
-    activation->data[batch * (row * col) + x * row + y] = d_output->data[x * row + y];
+    activation->data[x * col + y] = d_output->data[x * out_col + y];
   }
 }
 
@@ -278,20 +288,34 @@ __host__ void forward_propagation(
   const int *sizes = network->get_sizes();
   const uint layer_count = network->get_layer();
   dim3 blocks(BLOCKSIZE, BLOCKSIZE), grid;
+  const uint start_row = u_batches->rows(), start_col = u_batches->cols();
+
+  cudaError_t err = cudaMemPrefetchAsync(network, network->total_size, 0);
+  if (err != cudaSuccess) {
+    std::cerr << "Prefetch Error: " << cudaGetErrorString(err) << '\n';
+    return;
+  }
+
+  Matrix *d_output = nullptr;
 
   for (uint batch = 0; batch < batch_count; batch++) {
-    uint current_row = u_batches[batch].rows();
-    Matrix *d_output = nullptr;
-    
-    cudaMemPrefetchAsync(network, network->total_size, 0);
-    for (uint i = 0; i < layer_count; i++) {
 
+    uint64_t stride  = batch * (start_row * start_col * sizeof(float) + sizeof(Matrix));
+    Matrix *batch_i  = reinterpret_cast<Matrix*>(reinterpret_cast<char*>(u_batches) + stride); 
+    assert(batch_i != nullptr);
+    
+    uint current_row = batch_i->rows();
+    assert(current_row == 64); 
+
+    for (uint i = 0; i < layer_count; i++) {
+      assert(network->layers[i].weights.data != nullptr);
       std::cout << "Batch: " << batch << " Layer: " << i << '\n';
+      std::cout << "Layer Size: " << network->layers[i].weights.rows() << "x" << network->layers[i].weights.cols() << '\n';
       std::cout << "Current Row: " << current_row << '\n';
       std::cout << "Size: " << sizes[i+1] << '\n';
       
       // Multiply by weights 
-      Matrix *current_input = (i == 0) ? &u_batches[batch] : d_output;
+      Matrix *current_input = (i == 0) ? batch_i : d_output;
       if (i != 0) assert(d_output != nullptr);
 
       std::cout << arena.get_remaining() / 1e6 << " MB remaining\n";
@@ -321,7 +345,7 @@ __host__ void forward_propagation(
       // Apply activation function to z
       if (i != layer_count - 1) {
         activate(current_row, sizes[i+1], d_output, network->layers[i].type, false);
-        cudaError_t err = cudaDeviceSynchronize();
+        err = cudaDeviceSynchronize();
         if (err != cudaSuccess) {
           std::cerr << "Activate Error: " << cudaGetErrorString(err) << '\n';
           exit(EXIT_FAILURE);
@@ -331,8 +355,11 @@ __host__ void forward_propagation(
 
       // Append d_output to u_outputs
       insert_output<<<grid, blocks>>>(&network->activations[i + 1], d_output, batch, batch_count);
-      cudaDeviceSynchronize();
-      // Can't be done async since we need d_output to not be overwritten by batch 
+      err = cudaDeviceSynchronize();
+      if (err != cudaSuccess) {
+        std::cerr << "Insert Output Failure: " << cudaGetErrorString(err) << '\n';
+        return;
+      }
     }
     arena.reset();
   }

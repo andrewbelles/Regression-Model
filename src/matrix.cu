@@ -1,23 +1,27 @@
 #include "../include/matrix.hpp"
+#include <memory>
 
 // Matrix Kernels/Functions for GPU. 
 __host__ Matrix *new_matrix(int rows, int cols) {
-  // Uncasted pointer and size of memory  
-  void *full_ptr;
-  uint64_t size = sizeof(Matrix) + (rows * cols* sizeof(float)) + 31;
-  // Create memory for entire matrix block as contiguous 
-  // Why the fuck is this failing
-  cudaMallocManaged(&full_ptr, size);
+  // Find data size of matrix + data it can hold 
+  uint64_t data_size = (rows * cols * sizeof(float));
+  uint64_t size = sizeof(Matrix) + data_size;
 
-  Matrix *result = static_cast<Matrix*>(full_ptr);
-  uint64_t matrix_size = sizeof(Matrix);
-  uint64_t offset = (matrix_size + 31) & ~31; 
-  result->data = reinterpret_cast<float*>(reinterpret_cast<char*>(result) + offset);
+  Matrix *result;
+  cudaError_t err = cudaMallocManaged(&result, size);
+  if (err != cudaSuccess) {
+    std::cerr << "Matrix Malloc Failure: " << cudaGetErrorString(err) << '\n';
+    return NULL;
+  }
+
+  // Set pointers
   result->row = rows;
   result->col = cols;
+  result->data = reinterpret_cast<float*>(result + 1); 
 
   // Prefetch Memory to GPU 
   cudaMemPrefetchAsync(result, size, 0);
+  cudaMemPrefetchAsync(result->data, data_size, 0);
 #ifdef __debug
     std::cout << "Created New Matrix\n";
 #endif
@@ -28,22 +32,21 @@ __host__ Matrix *new_matrix(int rows, int cols) {
 
 // Fill matrix with vector, assertion of comparable size happens prior to call
 __global__ void fill_matrix(Matrix *matrix, float *vector) {
+  // Set contant indexes 
+  const uint col = matrix->cols(), row = matrix->rows();
   const uint x = blockIdx.x * blockDim.x + threadIdx.x;
   const uint y = blockIdx.y * blockDim.y + threadIdx.y;
 
-  if ( x < matrix->cols() && y < matrix->rows() ) {
+  if ( x < col && y < row ) {
     // Fill in correct place in memory
     const uint index = x * matrix->rows() + y;
-#ifdef __debug
-    printf("(%u, %u): %u\n", x, y, index);
-#endif
     matrix->data[index] = vector[index];  
   }
 } 
 
 // Scales each value in matrix by some scalar float 
 __global__ void scale_matrix(Matrix *matrix, float scalar) {
-
+  // Matches preceeding kernel 
   const uint col = matrix->cols(), row = matrix->rows();
   const uint x = blockIdx.x * blockDim.x + threadIdx.x;
   const uint y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -84,6 +87,7 @@ __global__ static void transpose_matrix_kernel(Matrix *a, Matrix *aT) {
   }
 }
 
+// TODO: Rewrite to return a temporary array on the device and take mxn as args
 __host__ Matrix *transpose_matrix(Matrix *a) {
   const uint row = a->rows(), col = a->cols();
 
@@ -102,28 +106,28 @@ __host__ Matrix *transpose_matrix(Matrix *a) {
 }
 
 
-// Passing lambda function through 
+// Passing lambda function through as F op 
 template <typename F> 
-__global__ static void matrix_element_operation_kernel(Matrix *matrix, const Matrix *addend, F op) {
+__global__ static void matrix_element_operation_kernel(Matrix *A, const Matrix *B, F op) {
   // Collect column and row indexes 
   const uint col = blockIdx.x * blockDim.x + threadIdx.x;
   const uint row = blockIdx.y * blockDim.y + threadIdx.y;
 
-  const int m_row = matrix->rows(), m_col = matrix->cols();
-  const int a_row = addend->rows(), a_col = addend->cols();
+  const int m = A->rows(), n = A->cols();
+  const int p = B->rows(), q = B->cols();
 
   // Handles broadcast intrinstically through y index selection
-  if (row < m_row && col < m_col) {
+  if (row < m && col < n) {
 
-    const int x = col * m_row + row;
+    const int x = col * m + row;
     // Index y depends on whether addend is a "Full", column, or vector matrix 
-    int y = (a_row == 1) 
+    int y = (p == 1) 
       ? col 
-      : (a_col == 1) 
+      : (q == 1) 
         ? row 
-        : col * a_row + row;
+        : col * p + row;
     
-    matrix->data[x] = op(matrix->data[x], addend->data[y]);
+    A->data[x] = op(A->data[x], B->data[y]);
   }
 }
 
@@ -133,8 +137,8 @@ __host__ void matrix_elementwise_operation(
   uint n,
   uint p,
   uint q,
-  Matrix *matrix,
-  Matrix *addend,
+  Matrix *A,
+  Matrix *B,
   ElementOperations op
 ) {
   // Check add and subtract bounding 
@@ -149,17 +153,17 @@ __host__ void matrix_elementwise_operation(
   // Run specified elementwise operation 
   switch (op) {
     case Add:
-      matrix_element_operation_kernel<<<grid, block>>>(matrix, addend,
+      matrix_element_operation_kernel<<<grid, block>>>(A, B,
         [] __device__ (float a, float b) {return a + b; });
       break;
     case Sub:
-      matrix_element_operation_kernel<<<grid, block>>>(matrix, addend,
+      matrix_element_operation_kernel<<<grid, block>>>(A, B,
         [] __device__ (float a, float b) {return a - b; });
       break;
     case Hadamard:
       // Hadamard Requires more stringent bounding 
       assert(m == p && n == q);
-      matrix_element_operation_kernel<<<grid, block>>>(matrix, addend,
+      matrix_element_operation_kernel<<<grid, block>>>(A, B,
         [] __device__ (float a, float b) {return a * b; });
       break;
     default: 
@@ -231,18 +235,15 @@ __global__ static void matrix_multiplication_kernel(Matrix *C, const Matrix *A, 
 }
 
 __global__ static void init_metadata_kernel(Matrix *M, uint row, uint col) {
-  uint64_t matrix_size = sizeof(Matrix);
-  uint64_t offset = (matrix_size + 31) & ~31;
   M->row  = row;
   M->col  = col;
-  M->data = reinterpret_cast<float*>(reinterpret_cast<char*>(M) + offset);
+  M->data = reinterpret_cast<float*>(M + 1);
 }
 
 // Has to be 1D block as syncthreads() only coordinates across a single block (?)
 __global__ static void set_matrix_kernel(Matrix *M) {
 
   const uint col = M->cols(), row = M->rows();
-
   const uint x = blockIdx.x * blockDim.x + threadIdx.x;
   const uint y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -255,9 +256,8 @@ __global__ static void set_matrix_kernel(Matrix *M) {
 // This isn't how shared threads work remember
 // They only sync PER BLOCK. This is a 2D block config therefore it will not act how you expect
 __global__ void convert_temporary_matrix(Matrix *U, Matrix *temp) {
-  uint col = temp->cols();
-  uint row = temp->rows();
 
+  const uint col = temp->cols(), row = temp->rows();
   const uint x = blockIdx.x * blockDim.x + threadIdx.x;
   const uint y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -271,8 +271,7 @@ __global__ void convert_temporary_matrix(Matrix *U, Matrix *temp) {
 __host__ static Matrix *new_temporary_matrix(ArenaAllocator &arena, uint row, uint col) {
 
   // Call arena for memory
-  uint64_t matrix_size = sizeof(Matrix) + (col * row * sizeof(float) + 31);
-  matrix_size = matrix_size & ~31;
+  uint64_t matrix_size = sizeof(Matrix) + (col * row * sizeof(float));
   Matrix *M = static_cast<Matrix*>(arena.allocate(matrix_size));
 
   std::cout << "Arena Allocated Size: " << matrix_size << " to M\n";
@@ -290,14 +289,14 @@ __host__ static Matrix *new_temporary_matrix(ArenaAllocator &arena, uint row, ui
   cudaError_t err = cudaDeviceSynchronize();
   if (err != cudaSuccess) {
     std::cerr << "Init sync error: " << cudaGetErrorString(err) << '\n';
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   set_matrix_kernel<<<grid, blocks>>>(M);
   err = cudaDeviceSynchronize();
   if (err != cudaSuccess) {
     std::cerr << "Set matrix sync error: " << cudaGetErrorString(err) << '\n';
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   // Return pointer
@@ -319,7 +318,7 @@ __host__ Matrix *matrix_multiplication(uint A_row, uint A_col, uint B_row, uint 
   cudaError_t err = cudaDeviceSynchronize();
   if (err != cudaSuccess) {
     std::cerr << "matmul sync error: " << cudaGetErrorString(err) << '\n';
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   return C;

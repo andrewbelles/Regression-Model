@@ -25,7 +25,7 @@ __host__ static void initialize_layer(Layer *layer) {
     case ActivationType::Sigmoid:
     default:
       uniform_range = sqrtf(6.0 / static_cast<float>(col + row));
-      break;
+break;
     case ActivationType::Leakyrelu:
     case ActivationType::Relu:
     case ActivationType::Elu:
@@ -83,6 +83,53 @@ __host__ static size_t calculate_network_size(uint *layer_sizes, uint layer_coun
 
   return total_size;
 }
+
+__host__ Network *new_network_rewrite(
+  uint *layer_sizes,
+  uint layer_count,
+  uint input_size,
+  std::vector<ActivationType> types
+) {
+  Network *network; 
+  const uint64_t total_size = calculate_network_size(layer_sizes, layer_count, input_size);
+  cudaError_t err = cudaMallocManaged(&network, total_size);
+  if (err != cudaSuccess) {
+    std::cerr << "Network Malloc Failure: " << cudaGetErrorString(err) << '\n';
+    return NULL;
+  }
+  
+  // Layer Array starts after metadata.
+  network->layers = reinterpret_cast<Layer*>(network + 1);
+  uint64_t offset = 0;
+  for (int i = 0; i < layer_count; i++) {
+    // Find the pointer to the current layer that is being set 
+    Layer *current_layer = (i == 0) 
+      ? network->layers
+      : reinterpret_cast<Layer*>(reinterpret_cast<char*>(network->layers + offset));
+    const uint previous_size = layer_sizes[i];
+    const uint current_size  = layer_sizes[i + 1];
+    
+    // Set layer's activation type 
+    current_layer->type = types[i];
+
+    // Set weights 
+    current_layer->weights.row  = previous_size;
+    current_layer->weights.col  = current_size;
+    current_layer->weights.data = reinterpret_cast<float*>(current_layer + 1);
+    // Find offset from weights matrix data; Matrix metadata plus size of data array
+    offset += (sizeof(Matrix) + previous_size * current_size * sizeof(float)); 
+
+    // Set bias 
+    current_layer->biases.row  = 1;
+    current_layer->biases.col  = current_size;
+    current_layer->biases.data = reinterpret_cast<float*>(
+      reinterpret_cast<char*>(current_layer + offset) 
+    );
+  }
+
+  return network;
+}
+
 
 // Takes array of sizes and array of Activation functions 
 __host__ Network *new_network(

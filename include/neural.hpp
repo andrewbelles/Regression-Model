@@ -12,11 +12,18 @@
 #include "../include/activation.hpp"
 #include "../include/matrix.hpp"
 
+// Matrix Structure Reference
+/*
+int row
+int col 
+float *data
+*/
+
 // Single Layer in Network
 typedef struct {
+  ActivationType type;
   Matrix weights;
   Matrix biases;
-  ActivationType type;
 } Layer;
 
 // Full network

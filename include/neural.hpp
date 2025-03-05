@@ -31,10 +31,12 @@ struct Network {
   Layer *layers;
   Matrix *activations;
   int layer_count;
-  int *sizes;
+  uint *sizes;
   uint64_t total_size;
+  uint *layer_strides;
+  uint *activation_strides;
 
-  __host__ __device__ int* get_sizes() const { return sizes; }
+  __host__ __device__ uint* get_sizes() const { return sizes; }
   __host__ __device__ uint get_layer() const { return layer_count; }
 };
 

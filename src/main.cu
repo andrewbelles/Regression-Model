@@ -12,8 +12,8 @@ int main(void) {
   std::mt19937 gen(rd());
   std::uniform_real_distribution<float> distr(-2.5, 2.5);
 
-  uint sizes[] = {1,16,1};
-  const uint layer_count = 2;
+  uint sizes[] = {1,128,128,1};
+  const uint layer_count = 3;
   std::vector<ActivationType> types;
   const uint input_size = 1024;
 

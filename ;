@@ -25,7 +25,7 @@ __host__ static void initialize_layer(Layer *layer) {
     case ActivationType::Sigmoid:
     default:
       uniform_range = sqrtf(6.0 / static_cast<float>(col + row));
-      break;
+break;
     case ActivationType::Leakyrelu:
     case ActivationType::Relu:
     case ActivationType::Elu:
@@ -92,10 +92,6 @@ __host__ Network *new_network(
 ) {
   Network *network; 
   const uint64_t total_size = calculate_network_size(layer_sizes, layer_count, input_size);
-  std::cout << "Layer_Count: " << layer_count << '\n';
-  uint *layer_strides = new uint[layer_count];
-  uint *activations_strides = new uint[layer_count + 1];
-
   cudaError_t err = cudaMallocManaged(&network, total_size);
   if (err != cudaSuccess) {
     std::cerr << "Network Malloc Failure: " << cudaGetErrorString(err) << '\n';
@@ -106,22 +102,19 @@ __host__ Network *new_network(
   network->layers = reinterpret_cast<Layer*>(network + 1);
   
   std::cout << "Explicit Size of Network Struct: " << sizeof(Network) << '\n';
-  std::cout << "Layer Address: 0x" << std::hex << reinterpret_cast<uint64_t>(network->layers) << '\n';
+  std::cout << "Layer Address: " << std::hex << reinterpret_cast<uint64_t>(network->layers) << '\n';
 
   uint64_t offset = 0;
   for (int i = 0; i < layer_count; i++) {
     // Find the pointer to the current layer that is being set 
     Layer *current_layer = (i == 0) 
       ? network->layers
-      : reinterpret_cast<Layer*>(reinterpret_cast<char*>(network->layers) + offset);
-
+      : reinterpret_cast<Layer*>(reinterpret_cast<char*>(network->layers + offset));
     const uint previous_size = layer_sizes[i];
     const uint current_size  = layer_sizes[i + 1];
-    std::cout << std::dec << "Previous Size: " << previous_size << "  Current Size: " << current_size << '\n';
     
     // Set layer's activation type 
     current_layer->type = types[i];
-    offset += sizeof(ActivationType);
 
     // Set weights 
     current_layer->weights.row  = previous_size;
@@ -134,79 +127,97 @@ __host__ Network *new_network(
     current_layer->biases.row  = 1;
     current_layer->biases.col  = current_size;
     current_layer->biases.data = reinterpret_cast<float*>(
-      reinterpret_cast<char*>(current_layer) + offset 
+      reinterpret_cast<char*>(current_layer + offset) 
     );
     offset += (sizeof(Matrix) + previous_size * sizeof(float));
-    offset += sizeof(uint32_t);
-    layer_strides[i] = offset;
-    initialize_layer(current_layer);
   }
 
   // Check if layer pointer is properly set 
-  Layer *check_l = reinterpret_cast<Layer*>(reinterpret_cast<char*>(network->layers));
-  check_l = reinterpret_cast<Layer*>(reinterpret_cast<char*>(check_l) + layer_strides[1]);
-  std::cout << "Weight Size = {" << check_l->weights.row << "}x{" << check_l->weights.col << "}\n";
+  Layer *check = reinterpret_cast<Layer*>(reinterpret_cast<char*>(network->layers));
+  std::cout << "Weight Size = {" << check->weights.row << "}x{" << check->weights.col << "}\n";
 
   // Set Activations 
   network->activations = reinterpret_cast<Matrix*>(reinterpret_cast<char*>(network) + offset);
 
-  std::cout << "Network Address: 0x" << std::hex << reinterpret_cast<uint64_t>(network) << '\n';
-  std::cout << "Activations Address: 0x" << std::hex << reinterpret_cast<uint64_t>(network->activations) << '\n';
+  std::cout << "Network Address: " << std::hex << reinterpret_cast<uint64_t>(network) << '\n';
+  std::cout << "Activations Address: " << std::hex << reinterpret_cast<uint64_t>(network->activations) << '\n';
 
-  uint offset_a = 0;
   for (int i = 0; i < layer_count + 1; i++) {
     const uint previous_size = layer_sizes[i];
-    Matrix *current_activation = (i == 0)
-      ? network->activations
-      : reinterpret_cast<Matrix*>(reinterpret_cast<char*>(network->activations) + offset_a);
-
-    current_activation->row  = input_size;
-    current_activation->col  = previous_size;
-    current_activation->data = reinterpret_cast<float*>(current_activation + 1); 
-    offset_a += (sizeof(Matrix) + previous_size * input_size * sizeof(float));
-
-    activations_strides[i] = offset_a;
-  }
-  offset += offset_a;
-
-  Matrix *check_a = reinterpret_cast<Matrix*>(reinterpret_cast<char*>(network->activations));
-  check_a = reinterpret_cast<Matrix*>(reinterpret_cast<char*>(check_a) + activations_strides[2]);
-  std::cout << std::dec;
-  std::cout << "Weight Size = {" << check_a->row << "}x{" << check_a->col << "}\n";
-
-  network->layer_count = layer_count;
-  offset += sizeof(int);
-  network->sizes = reinterpret_cast<uint*>(reinterpret_cast<char*>(network) + offset);
-  std::cout << "Sizes Address: 0x" << std::hex << reinterpret_cast<uint64_t>(network->sizes) << '\n';
-  for (int i = 0; i < layer_count + 1; i++) {
-    uint *size = (i == 0) ? network->sizes : network->sizes + (i * sizeof(uint));
-    *size = layer_sizes[i];
+    Matrix *current_activation;
   }
 
-  network->total_size = total_size;
-  offset += sizeof(uint64_t);
-  assert(offset < total_size);
-  network->layer_strides = reinterpret_cast<uint*>(reinterpret_cast<char*>(network) + offset);
-  std::cout << "L Strides Address: 0x" << std::hex << reinterpret_cast<uint64_t>(network->layer_strides) << '\n';
-  for (int i = 0; i < layer_count; i++) {
-    assert(offset + i * sizeof(uint) < total_size);
-    uint *stride = network->layer_strides + i;
-    *stride = layer_strides[i]; 
+  return network;
+}
+
+// Takes array of sizes and array of Activation functions 
+__host__ Network *_new_network(
+  uint *layer_sizes,
+  uint layer_count,
+  uint input_size,
+  std::vector<ActivationType> types
+) {
+  Network *network;
+  const uint64_t total_size = calculate_network_size(layer_sizes, layer_count, input_size);
+  cudaError_t err = cudaMallocManaged(&network, total_size);
+  if (err != cudaSuccess) {
+    std::cerr << "Network Malloc Failure: " << cudaGetErrorString(err) << '\n';
+    return NULL;
   }
 
-  offset += (sizeof(uint) * layer_count);
-  network->activation_strides = reinterpret_cast<uint*>(reinterpret_cast<char*>(network) + offset);
-  std::cout << "A Strides Address: 0x" << std::hex << reinterpret_cast<uint64_t>(network->activation_strides) << '\n';
-  for (int i = 0; i < layer_count + 1; i++) {
-    uint *stride = network->layer_strides + i;
-    *stride = activations_strides[i]; 
-  }
-  std::cout << std::dec;
+  // Reinterpret initial cast to grab pointers to metadata
+  network->layers      = reinterpret_cast<Layer*>(network + 1);
+  network->activations = reinterpret_cast<Matrix*>(network->layers + layer_count);
+  network->sizes       = reinterpret_cast<uint*>(network->activations + layer_count + 1);
+  network->layer_count = layer_count; 
+  network->total_size  = total_size;
   
-  std::cout << "Offset: " << offset << " Total Size: " << total_size << '\n';
-  std::cout << ">> Difference: " << total_size - offset << '\n';
-  assert(!(offset > total_size));
+  for (int i = 0; i <= layer_count; i++) {
+    network->sizes[i] = layer_sizes[i];
+  }
+  
+  // Cast address into uint64_t type 
+  uint64_t pointer_offset = reinterpret_cast<uint64_t>(network->sizes + layer_count + 1);
 
+  // Provide ownership to pointers for each Layer
+  for (int i = 0; i < layer_count; i++) {
+    const uint previous_size = layer_sizes[i];
+    const uint current_size  = layer_sizes[i + 1];
+
+    // Set weights metadata and collect location of data pointer from offset 
+    network->layers[i].weights.row  = previous_size;
+    network->layers[i].weights.col  = current_size; 
+    network->layers[i].weights.data = (float*)pointer_offset;
+    pointer_offset += (sizeof(Matrix) + static_cast<uint64_t>(sizeof(float) * previous_size * current_size));
+
+    // Set bias metadata and collect location of data pointer from offset 
+    network->layers[i].biases.row   = 1;
+    network->layers[i].biases.col   = current_size;
+    network->layers[i].biases.data  = (float*)pointer_offset;
+    pointer_offset += (sizeof(Matrix) + static_cast<uint64_t>(sizeof(float) * current_size));
+
+    // Set layers function 
+    network->layers[i].type = types[i];
+    
+    initialize_layer(&network->layers[i]);
+  }
+
+  // Pointer offset is onto activations now so the array's metadata can be set 
+  for (int i = 0; i < layer_count; i++) {
+    uint current_size = layer_sizes[i];
+
+    network->activations[i].row  = input_size;
+    network->activations[i].col  = current_size;
+    network->activations[i].data = (float*)pointer_offset;
+    pointer_offset += (sizeof(Matrix) + static_cast<uint64_t>(sizeof(float) * current_size * input_size));
+  }
+
+  // Send network to GPU. It should not return till free
+  err = cudaMemPrefetchAsync(network, total_size, 0);
+  if (err != cudaSuccess) {
+    std::cerr << "Prefetch Error: " << cudaGetErrorString(err) << '\n';
+    return NULL;
+  }
   return network;
 }
 

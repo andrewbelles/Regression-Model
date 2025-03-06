@@ -1,5 +1,7 @@
 #include "../include/neural.hpp"
+#include <cmath>
 #include <cuda_device_runtime_api.h>
+#include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 #include <driver_types.h>
 
@@ -64,6 +66,8 @@ __host__ static size_t calculate_network_size(uint *layer_sizes, uint layer_coun
   total_size += sizeof(uint) * (layer_count + 1);   // Sizes array 
   total_size += sizeof(Matrix) * (layer_count + 1); // Activation array metadata
 
+  total_size += (2 * sizeof(Matrix) * layer_count);
+
   // Iterate over each discrete layer
   for (uint i = 0; i < layer_count; i++) {
     // Find current and previous neuron counts from array
@@ -76,12 +80,23 @@ __host__ static size_t calculate_network_size(uint *layer_sizes, uint layer_coun
     uint64_t activation_data = (input_size * current_size) * sizeof(float); 
 
     // Sum
-    total_size += activation_data + weights_data + bias_data; 
+    total_size += (activation_data + weights_data + bias_data); 
   }
 
   total_size += (input_size * layer_sizes[0]) * sizeof(float);
 
   return total_size;
+}
+
+__global__ void print_matrix(Matrix *A) {
+  const uint col = A->cols(), row = A->rows();
+  const uint x = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint y = blockIdx.y * blockDim.y + threadIdx.y; 
+
+  if (x < col && y < row) {
+    const uint index = x * A->rows() + y;
+    printf("(%u, %u): %f\n", x, y, A->data[index]);
+  }
 }
 
 __host__ Network *new_network(
@@ -92,120 +107,68 @@ __host__ Network *new_network(
 ) {
   Network *network; 
   const uint64_t total_size = calculate_network_size(layer_sizes, layer_count, input_size);
+#ifdef __debug
   std::cout << "Layer_Count: " << layer_count << '\n';
-  uint *layer_strides = new uint[layer_count];
-  uint *activations_strides = new uint[layer_count + 1];
-
+#endif
   cudaError_t err = cudaMallocManaged(&network, total_size);
   if (err != cudaSuccess) {
     std::cerr << "Network Malloc Failure: " << cudaGetErrorString(err) << '\n';
-    return NULL;
+    return nullptr;
   }
   
-  // Layer Array starts after metadata.
-  network->layers = reinterpret_cast<Layer*>(network + 1);
-  
-  std::cout << "Explicit Size of Network Struct: " << sizeof(Network) << '\n';
-  std::cout << "Layer Address: 0x" << std::hex << reinterpret_cast<uint64_t>(network->layers) << '\n';
-
-  uint64_t offset = 0;
-  for (int i = 0; i < layer_count; i++) {
-    // Find the pointer to the current layer that is being set 
-    Layer *current_layer = (i == 0) 
-      ? network->layers
-      : reinterpret_cast<Layer*>(reinterpret_cast<char*>(network->layers) + offset);
-
-    const uint previous_size = layer_sizes[i];
-    const uint current_size  = layer_sizes[i + 1];
-    std::cout << std::dec << "Previous Size: " << previous_size << "  Current Size: " << current_size << '\n';
-    
-    // Set layer's activation type 
-    current_layer->type = types[i];
-    offset += sizeof(ActivationType);
-
-    // Set weights 
-    current_layer->weights.row  = previous_size;
-    current_layer->weights.col  = current_size;
-    current_layer->weights.data = reinterpret_cast<float*>(current_layer + 1);
-    // Find offset from weights matrix data; Matrix metadata plus size of data array
-    offset += (sizeof(Matrix) + previous_size * current_size * sizeof(float)); 
-
-    // Set bias 
-    current_layer->biases.row  = 1;
-    current_layer->biases.col  = current_size;
-    current_layer->biases.data = reinterpret_cast<float*>(
-      reinterpret_cast<char*>(current_layer) + offset 
-    );
-    offset += (sizeof(Matrix) + previous_size * sizeof(float));
-    offset += sizeof(uint32_t);
-    layer_strides[i] = offset;
-    initialize_layer(current_layer);
-  }
-
-  // Check if layer pointer is properly set 
-  Layer *check_l = reinterpret_cast<Layer*>(reinterpret_cast<char*>(network->layers));
-  check_l = reinterpret_cast<Layer*>(reinterpret_cast<char*>(check_l) + layer_strides[1]);
-  std::cout << "Weight Size = {" << check_l->weights.row << "}x{" << check_l->weights.col << "}\n";
-
-  // Set Activations 
-  network->activations = reinterpret_cast<Matrix*>(reinterpret_cast<char*>(network) + offset);
-
-  std::cout << "Network Address: 0x" << std::hex << reinterpret_cast<uint64_t>(network) << '\n';
-  std::cout << "Activations Address: 0x" << std::hex << reinterpret_cast<uint64_t>(network->activations) << '\n';
-
-  uint offset_a = 0;
-  for (int i = 0; i < layer_count + 1; i++) {
-    const uint previous_size = layer_sizes[i];
-    Matrix *current_activation = (i == 0)
-      ? network->activations
-      : reinterpret_cast<Matrix*>(reinterpret_cast<char*>(network->activations) + offset_a);
-
-    current_activation->row  = input_size;
-    current_activation->col  = previous_size;
-    current_activation->data = reinterpret_cast<float*>(current_activation + 1); 
-    offset_a += (sizeof(Matrix) + previous_size * input_size * sizeof(float));
-
-    activations_strides[i] = offset_a;
-  }
-  offset += offset_a;
-
-  Matrix *check_a = reinterpret_cast<Matrix*>(reinterpret_cast<char*>(network->activations));
-  check_a = reinterpret_cast<Matrix*>(reinterpret_cast<char*>(check_a) + activations_strides[2]);
-  std::cout << std::dec;
-  std::cout << "Weight Size = {" << check_a->row << "}x{" << check_a->col << "}\n";
-
+  network->total_size  = total_size;
   network->layer_count = layer_count;
-  offset += sizeof(int);
-  network->sizes = reinterpret_cast<uint*>(reinterpret_cast<char*>(network) + offset);
+
+  // Set pointers of struct manually 
+  char* ptr = reinterpret_cast<char*>(network) + sizeof(Network);
+  network->layers = reinterpret_cast<Layer*>(ptr);
+  ptr += sizeof(Layer) * layer_count;
+#ifdef __debug
+  std::cout << "Layer Address: 0x" << std::hex << reinterpret_cast<uint64_t>(network->layers) << '\n';
+#endif
+  network->sizes = reinterpret_cast<uint*>(ptr);
+  ptr += sizeof(uint) * (layer_count + 1);
+#ifdef __debug  
   std::cout << "Sizes Address: 0x" << std::hex << reinterpret_cast<uint64_t>(network->sizes) << '\n';
-  for (int i = 0; i < layer_count + 1; i++) {
-    uint *size = (i == 0) ? network->sizes : network->sizes + (i * sizeof(uint));
-    *size = layer_sizes[i];
-  }
-
-  network->total_size = total_size;
-  offset += sizeof(uint64_t);
-  assert(offset < total_size);
-  network->layer_strides = reinterpret_cast<uint*>(reinterpret_cast<char*>(network) + offset);
-  std::cout << "L Strides Address: 0x" << std::hex << reinterpret_cast<uint64_t>(network->layer_strides) << '\n';
+#endif
+  network->activations = reinterpret_cast<Matrix*>(ptr);
+  ptr += sizeof(Matrix) * (layer_count + 1);
+#ifdef __debug  
+  std::cout << "Activations Address: 0x" << std::hex << reinterpret_cast<uint64_t>(network->activations) << '\n';
+#endif
   for (int i = 0; i < layer_count; i++) {
-    assert(offset + i * sizeof(uint) < total_size);
-    uint *stride = network->layer_strides + i;
-    *stride = layer_strides[i]; 
+    // Collect layer
+    Layer& layer = network->layers[i];
+    layer.weights.data = reinterpret_cast<float*>(ptr); 
+    // Advance ptr 
+    ptr += layer_sizes[i] * layer_sizes[i+1] * sizeof(float);
+
+    layer.biases.data  = reinterpret_cast<float*>(ptr);
+    ptr += layer_sizes[i+1] * sizeof(float);
   }
 
-  offset += (sizeof(uint) * layer_count);
-  network->activation_strides = reinterpret_cast<uint*>(reinterpret_cast<char*>(network) + offset);
-  std::cout << "A Strides Address: 0x" << std::hex << reinterpret_cast<uint64_t>(network->activation_strides) << '\n';
-  for (int i = 0; i < layer_count + 1; i++) {
-    uint *stride = network->layer_strides + i;
-    *stride = activations_strides[i]; 
+  for (int i = 0; i < layer_count; i++) {
+    Layer& layer = network->layers[i];
+
+    layer.type = types[i];
+    layer.weights.row = layer_sizes[i];
+    layer.weights.col = layer_sizes[i+1];
+    layer.biases.row  = 1;
+    layer.biases.col  = layer_sizes[i+1];
+    initialize_layer(&layer);
   }
-  std::cout << std::dec;
-  
-  std::cout << "Offset: " << offset << " Total Size: " << total_size << '\n';
-  std::cout << ">> Difference: " << total_size - offset << '\n';
-  assert(!(offset > total_size));
+
+  for (int i = 0; i < layer_count + 1; i++) {
+    Matrix& activation = network->activations[i];
+    activation.row  = input_size;
+    activation.col  = layer_sizes[i];
+    activation.data = reinterpret_cast<float*>(ptr);
+    ptr += (input_size * layer_sizes[i] * sizeof(float));
+  }
+
+  for (int i = 0; i < layer_count + 1; i++) {
+    network->sizes[i] = layer_sizes[i];
+  }
 
   return network;
 }
@@ -238,19 +201,93 @@ __global__ static void slice_input_vector(
 }
 
 __host__ Matrix *input_to_batch_array(
-  ArenaAllocator &arena,
+  ArenaAllocator& arena,
   float *input_vector,
   uint64_t input_size,
   uint feature_count,
   uint *batch_count
 ) {
-  const uint BATCHSIZE = 64; 
+  const uint batchsize = 64;
+  Matrix *batches;
+  arena.reset();  // Force arena reset 
+  
+  float *d_inputs = reinterpret_cast<float*>(arena.allocate(input_size * feature_count * sizeof(float)));
+  cudaError_t err = cudaMemcpyAsync(d_inputs, input_vector, input_size * feature_count * sizeof(float), cudaMemcpyHostToDevice, arena.get_stream());
+  if (err != cudaSuccess) {
+    std::cerr << "Memcpy Failure: " << cudaGetErrorString(err) << '\n';
+    return nullptr;
+  }
+
+  // Calculate size of batch matrix 
+  uint quotient  = input_size / batchsize; 
+  uint remainder = input_size % batchsize;
+  *batch_count = quotient + (remainder != 0 ? 1 : 0);
+
+  uint64_t matrix_size = *batch_count * sizeof(Matrix);
+  uint64_t data_size   = (quotient * batchsize + remainder) * feature_count * sizeof(float);
+  uint64_t total_size  = matrix_size + data_size;
+
+  err = cudaMallocManaged(&batches, total_size);
+  if (err != cudaSuccess) {
+    std::cerr << "Batches Malloc Error: " << cudaGetErrorString(err) << '\n';
+    return NULL;
+  }
+
+  char* ptr = reinterpret_cast<char*>(batches) + matrix_size;
+  for (int i = 0; i < *batch_count; i++) {
+    const uint rows = (i == *batch_count - 1 && remainder != 0) ? remainder : batchsize;
+
+    batches[i].row  = rows;
+    batches[i].col  = feature_count;
+    batches[i].data = reinterpret_cast<float*>(ptr);
+    ptr += (rows * feature_count * sizeof(float));
+  }
+
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    std::cerr << "Sync Error: " << cudaGetErrorString(err) << '\n';
+    return nullptr;
+  }
+  
+  // Shift d_inputs into each batch array
+  cudaStream_t stream = arena.get_stream();
+  for (int i = 0; i < *batch_count; i++) {
+    uint rows = batches[i].row;
+    uint cols = feature_count * sizeof(float);
+    
+    float *src = d_inputs + i * batchsize * feature_count;
+    float *dst = batches[i].data;
+    
+    err = cudaMemcpy2DAsync(dst, cols, src, cols, cols, rows, cudaMemcpyDeviceToDevice, stream);
+  
+    if (err != cudaSuccess) {
+      std::cerr <<"d_inputs to Batches Failure: " << cudaGetErrorString(err) << '\n';
+      return nullptr;
+    }
+  }
+
+  cudaStreamSynchronize(stream);
+
+
+  arena.reset();
+
+  return batches;
+}
+
+__host__ Matrix *input_to_batch_array_(
+  ArenaAllocator &arena,
+  float *input_vector,
+uint64_t input_size,
+  uint feature_count,
+  uint *batch_count
+) {
+const uint BATCHSIZE = 64; 
   Matrix *batch_matrix;
   arena.reset();  // Force a reset to arena to ensure enough space 
 
   // Allocate memory on arena
   float *d_inputs = static_cast<float*>(arena.allocate(input_size * feature_count * sizeof(float)));
-  // Async call to copy data to input vector 
+// Async call to copy data to input vector 
   cudaError_t err = cudaMemcpyAsync(d_inputs, input_vector, input_size * sizeof(float), cudaMemcpyHostToDevice, arena.get_stream());
   if (err != cudaSuccess) {
     std::cerr << "Memcpy Inputs to Device Failure: " << cudaGetErrorString(err) << '\n';
@@ -345,7 +382,6 @@ __host__ void forward_propagation(
   dim3 blocks(BLOCKSIZE, BLOCKSIZE), grid;
   const uint start_row = u_batches->rows(), start_col = u_batches->cols();
 
-  std::cout << "Size: " << network->total_size << '\n';
   cudaError_t err = cudaMemPrefetchAsync(network, network->total_size, 0);
   if (err != cudaSuccess) {
     std::cerr << "Prefetch Error: " << cudaGetErrorString(err) << '\n';
@@ -354,27 +390,20 @@ __host__ void forward_propagation(
 
   Matrix *d_output = nullptr;
 
-  for (uint batch = 0; batch < batch_count; batch++) {
+  for (uint b = 0; b < batch_count; b++) {
 
-    uint64_t stride  = batch * (start_row * start_col * sizeof(float) + sizeof(Matrix));
-    Matrix *batch_i  = reinterpret_cast<Matrix*>(reinterpret_cast<char*>(u_batches) + stride); 
-    assert(batch_i != nullptr);
+    Matrix& batch = u_batches[b];
     
-    uint current_row = batch_i->rows();
+    uint current_row = batch.rows();
     assert(current_row == 64); 
 
     for (uint i = 0; i < layer_count; i++) {
       assert(network->layers[i].weights.data != nullptr);
-      std::cout << "Batch: " << batch << " Layer: " << i << '\n';
-      std::cout << "Layer Size: " << network->layers[i].weights.rows() << "x" << network->layers[i].weights.cols() << '\n';
-      std::cout << "Current Row: " << current_row << '\n';
-      std::cout << "Size: " << sizes[i+1] << '\n';
       
       // Multiply by weights 
-      Matrix *current_input = (i == 0) ? batch_i : d_output;
+      Matrix *current_input = (i == 0) ? &batch : d_output;
       if (i != 0) assert(d_output != nullptr);
 
-      std::cout << arena.get_remaining() / 1e6 << " MB remaining\n";
       d_output = matrix_multiplication(
         current_row,
         sizes[i],
@@ -410,7 +439,7 @@ __host__ void forward_propagation(
       }      
 
       // Append d_output to u_outputs
-      insert_output<<<grid, blocks>>>(&network->activations[i + 1], d_output, batch, batch_count);
+      insert_output<<<grid, blocks>>>(&network->activations[i + 1], d_output, b, batch_count);
       err = cudaDeviceSynchronize();
       if (err != cudaSuccess) {
         std::cerr << "Insert Output Failure: " << cudaGetErrorString(err) << '\n';

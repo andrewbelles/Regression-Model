@@ -274,8 +274,6 @@ __host__ static Matrix *new_temporary_matrix(ArenaAllocator &arena, uint row, ui
   uint64_t matrix_size = sizeof(Matrix) + (col * row * sizeof(float));
   Matrix *M = static_cast<Matrix*>(arena.allocate(matrix_size));
 
-  std::cout << "Arena Allocated Size: " << matrix_size << " to M\n";
-
   // Assert ptr is non-null
   assert(M != nullptr);
 
@@ -309,7 +307,6 @@ __host__ Matrix *matrix_multiplication(uint A_row, uint A_col, uint B_row, uint 
   assert(A_col == B_row);
 
   Matrix *C = new_temporary_matrix(arena, A_row, B_col);
-  std::cout << "Allocated C from arena allocator\n";
 
   dim3 block(BLOCKSIZE, BLOCKSIZE);
   dim3 grid((B_col + BLOCKSIZE - 1) / BLOCKSIZE, (A_row + BLOCKSIZE - 1) / BLOCKSIZE);
@@ -317,7 +314,7 @@ __host__ Matrix *matrix_multiplication(uint A_row, uint A_col, uint B_row, uint 
   matrix_multiplication_kernel<<<grid, block>>>(C, A, B);
   cudaError_t err = cudaDeviceSynchronize();
   if (err != cudaSuccess) {
-    std::cerr << "matmul sync error: " << cudaGetErrorString(err) << '\n';
+    std::cerr << "Matmul sync error: " << cudaGetErrorString(err) << '\n';
     return NULL;
   }
 

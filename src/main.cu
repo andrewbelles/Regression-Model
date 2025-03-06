@@ -24,7 +24,7 @@ int main(void) {
   std::cout << "Arena Allocated to: " << 512 * 512 * 1024 / 1e6 << " MB\n";
 
   for (int i = 0; i < layer_count; i++) {
-    types.push_back(ActivationType::Tanh);
+    types.push_back(ActivationType::Relu);
   }
 
   Network *network = new_network(sizes, layer_count, input_size, types);
@@ -46,6 +46,16 @@ int main(void) {
   forward_propagation(network, batches, arena, batch_count, input_size);
 
   std::cout << "Forward Propagated\n";
+
+  // Read last activation layer 
+  const uint count = network->get_layer();
+  for (int i = 0 ; i < network->activations[layer_count].cols(); i++) {
+    std::cout << "[ ";
+    for (int j = 0; j < network->activations[layer_count].rows(); j++) {
+      std::cout << network->activations[layer_count].data[i * network->activations[layer_count].rows() + j] << " ";
+    }
+    std::cout << "]\n";
+  }
 
   cudaFree(network);
   cudaFree(batches);

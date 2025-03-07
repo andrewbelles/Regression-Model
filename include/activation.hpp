@@ -16,6 +16,23 @@ enum class ActivationType {
 
 template<ActivationType T> struct ActivationFunction;
 
+template<> struct ActivationFunction<ActivationType::Relu> {
+  __device__ static float activate(float x) { 
+    if (x > 0.0) {
+      return x;
+    } else {
+      return 0.0;
+    }
+  }
+  __device__ static float derivative(float x) {
+    if (x > 0.0) {
+      return 1.0; 
+    } else {
+      return 0.0;
+    }
+  }
+};
+
 template<> struct ActivationFunction<ActivationType::Tanh> {
   __device__ static float activate(float x) { return tanh(x); }
   __device__ static float derivative(float x) {

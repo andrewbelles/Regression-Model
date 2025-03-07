@@ -40,6 +40,9 @@ __host__ void activate(const uint m, const uint n, Matrix *A, ActivationType typ
       case ActivationType::Tanh: 
         activate_kernel<ActivationType::Tanh><<<grid, blocks>>>(A);
         break;
+      case ActivationType::Relu:
+        activate_kernel<ActivationType::Relu><<<grid, blocks>>>(A);
+        break;
       default:
         std::cerr << "Invalid Activation Function\n";
         exit(EXIT_FAILURE);
@@ -52,6 +55,9 @@ __host__ void activate(const uint m, const uint n, Matrix *A, ActivationType typ
         break;
       case ActivationType::Tanh: 
         derivative_kernel<ActivationType::Tanh><<<grid, blocks>>>(A);
+        break;
+      case ActivationType::Relu:
+        derivative_kernel<ActivationType::Relu><<<grid, blocks>>>(A);
         break;
       default:
         std::cerr << "Invalid Activation Function\n";
